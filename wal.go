@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 )
 
 var (
@@ -90,18 +89,16 @@ const maxReaders = 8 // maximum number of opened readers.
 
 // Log represents a write ahead log
 type Log struct {
-	path string  // absolute path to log directory
-	opts Options // log options
-
-	mu         sync.Mutex // lock all things below
-	closed     bool       // log is closed
-	segments   []segment  // all known log segments
-	firstIndex uint64     // index of the first entry in log
-	lastIndex  uint64     // index of the last entry in log
-	file       *os.File   // tail segment file handle
-	buffer     []byte     // tail segment file write buffer
-	fileSize   int        // tail segment file size, including buffer
-	readers    []*reader  // all opened readers
+	path       string    // absolute path to log directory
+	opts       Options   // log options
+	closed     bool      // log is closed
+	segments   []segment // all known log segments
+	firstIndex uint64    // index of the first entry in log
+	lastIndex  uint64    // index of the last entry in log
+	file       *os.File  // tail segment file handle
+	buffer     []byte    // tail segment file write buffer
+	fileSize   int       // tail segment file size, including buffer
+	readers    []*reader // all opened readers
 }
 
 // segment represents a single segment file.
@@ -272,8 +269,6 @@ func segmentName(index uint64) string {
 
 // Close the log
 func (l *Log) Close() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.closed {
 		return ErrClosed
 	}
@@ -300,8 +295,6 @@ func (l *Log) flush() {
 
 // Write an entry to the log.
 func (l *Log) Write(index uint64, data []byte) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.closed {
 		return ErrClosed
 	}
@@ -407,8 +400,6 @@ func (b *Batch) Clear() {
 // WriteBatch writes the entries in the batch to the log in the order that they
 // were added to the batch. The batch is cleared upon a successful return.
 func (l *Log) WriteBatch(b *Batch) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.closed {
 		return ErrClosed
 	}
@@ -441,8 +432,6 @@ func (l *Log) WriteBatch(b *Batch) error {
 // FirstIndex returns the index of the first entry in the log. Returns zero
 // when log has no entries.
 func (l *Log) FirstIndex() (index uint64, err error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.closed {
 		return 0, ErrClosed
 	}
@@ -457,8 +446,6 @@ func (l *Log) FirstIndex() (index uint64, err error) {
 // LastIndex returns the index of the last entry in the log. Returns zero when
 // log has no entries.
 func (l *Log) LastIndex() (index uint64, err error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.closed {
 		return 0, ErrClosed
 	}
@@ -485,8 +472,6 @@ func (l *Log) findSegment(index uint64) int {
 // Read an entry from the log. This function reads an entry from disk and is
 // optimized for sequential reads. Randomly accessing entries is slow.
 func (l *Log) Read(index uint64) (data []byte, err error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.closed {
 		return nil, ErrClosed
 	}
@@ -668,8 +653,6 @@ func readEntry(rd *bufio.Reader, frmt LogFormat, discardData bool) (
 // are before the provided `firstIndex`. In other words the entry at
 // `firstIndex` becomes the first entry in the log.
 func (l *Log) TruncateFront(firstIndex uint64) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.closed {
 		return ErrClosed
 	}
@@ -780,8 +763,6 @@ func (l *Log) TruncateFront(firstIndex uint64) error {
 // are after the provided `lastIndex`. In other words the entry at `lastIndex`
 // becomes the last entry in the log.
 func (l *Log) TruncateBack(lastIndex uint64) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.closed {
 		return ErrClosed
 	}
