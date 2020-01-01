@@ -72,7 +72,7 @@ type Options struct {
 	// Durability policy. Default is High.
 	Durability Durability
 	// SegmentSize of each segment. This is just a target value, actual size
-	// may differ. Default is 500 MB.
+	// may differ. Default is 50 MB.
 	SegmentSize int
 	// LogFormat is the format of the log files. Default is Binary.
 	LogFormat LogFormat
