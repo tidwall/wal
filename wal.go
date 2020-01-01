@@ -869,3 +869,15 @@ func (l *Log) TruncateBack(lastIndex uint64) error {
 	l.lastIndex = index
 	return nil
 }
+
+// Sync performs an fsync on the log. This is not necessary when the
+// durability is set to High.
+func (l *Log) Sync() {
+	if len(l.buffer) > 0 {
+		must(l.file.Write(l.buffer))
+		l.buffer = l.buffer[:0]
+	}
+	if l.opts.Durability < High {
+		must(nil, l.file.Sync())
+	}
+}

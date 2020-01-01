@@ -417,6 +417,14 @@ func testLog(t *testing.T, opts *Options, N int) {
 	N--
 	testFirstLast(t, l, uint64(N), uint64(N))
 
+	if err = l.Write(uint64(N+1), []byte(dataStr(uint64(N+1)))); err != nil {
+		t.Fatal(err)
+	}
+	N++
+
+	l.Sync()
+	testFirstLast(t, l, uint64(N-1), uint64(N))
+
 }
 
 func testFirstLast(t *testing.T, l *Log, expectFirst, expectLast uint64) {
