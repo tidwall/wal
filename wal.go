@@ -2,6 +2,7 @@ package wal
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
+	"unsafe"
 )
 
 var (
@@ -343,22 +346,20 @@ func appendJSONEntry(dst []byte, index uint64, data []byte) []byte {
 	dst = append(dst, `{"index":"`...)
 	dst = strconv.AppendUint(dst, index, 10)
 	dst = append(dst, `","data":`...)
-	dst = appendJSONString(dst, data)
+	dst = appendJSONData(dst, data)
 	dst = append(dst, '}', '\n')
 	return dst
 }
 
-func appendJSONString(dst []byte, s []byte) []byte {
-	for i := 0; i < len(s); i++ {
-		if s[i] < ' ' || s[i] == '\\' || s[i] == '"' || s[i] > 126 {
-			d, _ := json.Marshal(string(s))
-			return append(dst, d...)
-		}
+func appendJSONData(dst []byte, s []byte) []byte {
+	if utf8.Valid(s) {
+		b, _ := json.Marshal(*(*string)(unsafe.Pointer(&s)))
+		dst = append(dst, '"', '+')
+		return append(dst, b[1:]...)
 	}
-	dst = append(dst, '"')
-	dst = append(dst, s...)
-	dst = append(dst, '"')
-	return dst
+	dst = append(dst, '"', '$')
+	dst = append(dst, base64.URLEncoding.EncodeToString(s)...)
+	return append(dst, '"')
 }
 
 func appendBinaryEntry(dst []byte, index uint64, data []byte) []byte {
@@ -615,11 +616,21 @@ func readEntry(rd *bufio.Reader, frmt LogFormat, discardData bool) (
 			return 0, nil, ErrCorrupt
 		}
 		s, ok := m["data"]
-		if !ok {
+		if !ok || len(s) == 0 {
 			return 0, nil, ErrCorrupt
 		}
 		if !discardData {
-			data = []byte(s)
+			switch s[0] {
+			case '$':
+				data, err = base64.URLEncoding.DecodeString(s[1:])
+				if err != nil {
+					return 0, nil, ErrCorrupt
+				}
+			case '+':
+				data = []byte(s[1:])
+			default:
+				return 0, nil, ErrCorrupt
+			}
 		}
 		return index, data, nil
 	}

@@ -613,3 +613,28 @@ func makeOpts(segSize int, dur Durability, lf LogFormat) *Options {
 	opts.LogFormat = lf
 	return &opts
 }
+
+// https://github.com/tidwall/wal/issues/1
+func TestIssue1(t *testing.T) {
+	in := []byte{0, 0, 0, 0, 0, 0, 0, 1, 37, 108, 131, 178, 151, 17, 77, 32,
+		27, 48, 23, 159, 63, 14, 240, 202, 206, 151, 131, 98, 45, 165, 151, 67,
+		38, 180, 54, 23, 138, 238, 246, 16, 0, 0, 0, 0}
+	opts := *DefaultOptions
+	opts.LogFormat = JSON
+	os.RemoveAll("testlog")
+	l, err := Open("testlog", &opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if err := l.Write(1, in); err != nil {
+		t.Fatal(err)
+	}
+	out, err := l.Read(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(in) != string(out) {
+		t.Fatal("data mismatch")
+	}
+}
