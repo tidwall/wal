@@ -1,20 +1,23 @@
 package wal
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 	"unsafe"
+
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/tinylru"
 )
 
 var (
@@ -42,22 +45,6 @@ var (
 	ErrOutOfRange = errors.New("out of range")
 )
 
-// Durability policy.
-type Durability int8
-
-const (
-	// Low durability flushes data to operating system only when the buffer is
-	// at capacity. A process crash could cause data loss.
-	Low Durability = -1
-	// Medium durability flushes data to the operating system after every
-	// new entry is addded to the log. A server crash could cause data loss.
-	Medium Durability = 0
-	// High durability syncs data to disk after every new entry is added to
-	// the log. All entries are persisted to disk and crashes will not cause
-	// data loss.
-	High Durability = 1
-)
-
 // LogFormat is the format of the log files.
 type LogFormat byte
 
@@ -72,49 +59,54 @@ const (
 
 // Options for Log
 type Options struct {
-	// Durability policy. Default is High.
-	Durability Durability
+	// NoSync disables fsync after writes. This is less durable and puts the
+	// log at risk of data loss when there's a server crash.
+	NoSync bool
 	// SegmentSize of each segment. This is just a target value, actual size
-	// may differ. Default is 50 MB.
+	// may differ. Default is 20 MB.
 	SegmentSize int
 	// LogFormat is the format of the log files. Default is Binary.
 	LogFormat LogFormat
+	// SegmentCacheSize is the maximum number of segments that will be held in
+	// memory for caching. Increasing this value may enhance performance for
+	// concurrent read operations. Default is 1
+	SegmentCacheSize int
 }
 
 // DefaultOptions for Open().
 var DefaultOptions = &Options{
-	Durability:  High,     // Fsync after every write
-	SegmentSize: 52428800, // 50 MB log segment files.
-	LogFormat:   Binary,   // Binary format is small and fast.
+	NoSync:           false,    // Fsync after every write
+	SegmentSize:      20971520, // 20 MB log segment files.
+	LogFormat:        Binary,   // Binary format is small and fast.
+	SegmentCacheSize: 1,        // Number of cached in-memory segments
 }
-
-const maxReaders = 8 // maximum number of opened readers.
 
 // Log represents a write ahead log
 type Log struct {
-	path       string    // absolute path to log directory
-	opts       Options   // log options
-	closed     bool      // log is closed
-	segments   []segment // all known log segments
-	firstIndex uint64    // index of the first entry in log
-	lastIndex  uint64    // index of the last entry in log
-	file       *os.File  // tail segment file handle
-	buffer     []byte    // tail segment file write buffer
-	fileSize   int       // tail segment file size, including buffer
-	readers    []*reader // all opened readers
+	mu         sync.Mutex
+	path       string      // absolute path to log directory
+	opts       Options     // log options
+	closed     bool        // log is closed
+	corrupt    bool        // log may be corrupt
+	segments   []*segment  // all known log segments
+	firstIndex uint64      // index of the first entry in log
+	lastIndex  uint64      // index of the last entry in log
+	sfile      *os.File    // tail segment file handle
+	wbatch     Batch       // reusable write batch
+	scache     tinylru.LRU // segment entries cache
 }
 
 // segment represents a single segment file.
 type segment struct {
 	path  string // path of segment file
 	index uint64 // first index of segment
+	ebuf  []byte // cached entries buffer
+	epos  []bpos // cached entries positions in buffer
 }
 
-type reader struct {
-	sindex int           // segment index
-	nindex uint64        // next entry index
-	file   *os.File      // opened file
-	rd     *bufio.Reader // reader
+type bpos struct {
+	pos int // byte position
+	end int // one byte past pos
 }
 
 // Open a new write ahead log
@@ -122,13 +114,22 @@ func Open(path string, opts *Options) (*Log, error) {
 	if opts == nil {
 		opts = DefaultOptions
 	}
+	if opts.SegmentCacheSize <= 0 {
+		opts.SegmentCacheSize = DefaultOptions.SegmentCacheSize
+	}
+	if opts.SegmentSize <= 0 {
+		opts.SegmentSize = DefaultOptions.SegmentSize
+	}
 	var err error
 	path, err = abs(path)
 	if err != nil {
 		return nil, err
 	}
 	l := &Log{path: path, opts: *opts}
-	_ = os.MkdirAll(path, 0777)
+	l.scache.Resize(l.opts.SegmentCacheSize)
+	if err := os.MkdirAll(path, 0777); err != nil {
+		return nil, err
+	}
 	if err := l.load(); err != nil {
 		return nil, err
 	}
@@ -140,6 +141,16 @@ func abs(path string) (string, error) {
 		return "", errors.New("in-memory log not supported")
 	}
 	return filepath.Abs(path)
+}
+
+func (l *Log) pushCache(segIdx int) {
+	_, _, _, v, evicted :=
+		l.scache.SetEvicted(segIdx, l.segments[segIdx])
+	if evicted {
+		s := v.(*segment)
+		s.ebuf = nil
+		s.epos = nil
+	}
 }
 
 // load all the segments. This operation also cleansup any START/END segments.
@@ -167,7 +178,7 @@ func (l *Log) load() error {
 			} else if isEnd && endIdx == -1 {
 				endIdx = len(l.segments)
 			}
-			l.segments = append(l.segments, segment{
+			l.segments = append(l.segments, &segment{
 				index: index,
 				path:  filepath.Join(l.path, name),
 			})
@@ -175,13 +186,13 @@ func (l *Log) load() error {
 	}
 	if len(l.segments) == 0 {
 		// Create a new log
-		l.segments = append(l.segments, segment{
+		l.segments = append(l.segments, &segment{
 			index: 1,
 			path:  filepath.Join(l.path, segmentName(1)),
 		})
 		l.firstIndex = 1
 		l.lastIndex = 0
-		l.file, err = os.Create(l.segments[0].path)
+		l.sfile, err = os.Create(l.segments[0].path)
 		return err
 	}
 	// Open existing log. Clean up log if START of END segments exists.
@@ -196,7 +207,7 @@ func (l *Log) load() error {
 				return err
 			}
 		}
-		l.segments = append([]segment{}, l.segments[startIdx:]...)
+		l.segments = append([]*segment{}, l.segments[startIdx:]...)
 		// Rename the START segment
 		orgPath := l.segments[0].path
 		finalPath := orgPath[:len(orgPath)-len(".START")]
@@ -213,7 +224,7 @@ func (l *Log) load() error {
 				return err
 			}
 		}
-		l.segments = append([]segment{}, l.segments[:endIdx+1]...)
+		l.segments = append([]*segment{}, l.segments[:endIdx+1]...)
 		if len(l.segments) > 1 && l.segments[len(l.segments)-2].index ==
 			l.segments[len(l.segments)-1].index {
 			// remove the segment prior to the END segment because it shares
@@ -230,38 +241,22 @@ func (l *Log) load() error {
 		}
 		l.segments[len(l.segments)-1].path = finalPath
 	}
-	// Open the last segment for appending
 	l.firstIndex = l.segments[0].index
-	l.file, err = os.OpenFile(l.segments[len(l.segments)-1].path,
-		os.O_RDWR, 0666)
+	// Open the last segment for appending
+	lseg := l.segments[len(l.segments)-1]
+	l.sfile, err = os.OpenFile(lseg.path, os.O_WRONLY, 0666)
 	if err != nil {
 		return err
 	}
-	// Read the last segment to the end of the log
-	rd := bufio.NewReader(l.file)
-	for {
-		idx, _, err := readEntry(rd, l.opts.LogFormat, true)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
-		}
-		l.lastIndex = idx
-	}
-	n, err := l.file.Seek(0, 2)
-	if err != nil {
+	if _, err := l.sfile.Seek(0, 2); err != nil {
 		return err
 	}
-	l.fileSize = int(n)
+	// Load the last segment entries
+	if err := l.loadSegmentEntries(lseg); err != nil {
+		return err
+	}
+	l.lastIndex = lseg.index + uint64(len(lseg.epos)) - 1
 	return nil
-}
-
-func must(v interface{}, err error) interface{} {
-	if err != nil {
-		panic(err)
-	}
-	return v
 }
 
 // segmentName returns a 20-byte textual representation of an index
@@ -270,85 +265,84 @@ func segmentName(index uint64) string {
 	return fmt.Sprintf("%020d", index)
 }
 
-// Close the log
+// Close the log.
 func (l *Log) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.closed {
+		if l.corrupt {
+			return ErrCorrupt
+		}
 		return ErrClosed
 	}
-	l.flush()
-	must(nil, l.file.Close())
-	for len(l.readers) > 0 {
-		l.closeReader(l.readers[0])
+	if err := l.sfile.Sync(); err != nil {
+		return err
 	}
-	l.readers = nil
-	l.segments = nil
+	if err := l.sfile.Close(); err != nil {
+		return err
+	}
 	l.closed = true
-	return nil
-}
-
-func (l *Log) flush() {
-	if len(l.buffer) > 0 {
-		must(l.file.Write(l.buffer))
-		l.buffer = l.buffer[:0]
-		if l.opts.Durability >= High {
-			must(nil, l.file.Sync())
-		}
+	if l.corrupt {
+		return ErrCorrupt
 	}
+	return nil
 }
 
 // Write an entry to the log.
 func (l *Log) Write(index uint64, data []byte) error {
-	if l.closed {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.corrupt {
+		return ErrCorrupt
+	} else if l.closed {
 		return ErrClosed
 	}
-	if index != l.lastIndex+1 {
-		return ErrOutOfOrder
+	l.wbatch.Clear()
+	l.wbatch.Write(index, data)
+	return l.writeBatch(&l.wbatch)
+}
+
+func (l *Log) appendEntry(dst []byte, index uint64, data []byte) (out []byte,
+	epos bpos) {
+	if l.opts.LogFormat == JSON {
+		return appendJSONEntry(dst, index, data)
 	}
-	if l.fileSize >= l.opts.SegmentSize {
-		l.cycle()
-	}
-	l.appendEntry(index, data)
-	if l.opts.Durability >= Medium || len(l.buffer) >= 4096 {
-		l.flush()
-	}
-	l.lastIndex = index
-	return nil
+	return appendBinaryEntry(dst, data)
 }
 
 // Cycle the old segment for a new segment.
-func (l *Log) cycle() {
-	l.flush()
-	must(nil, l.file.Close())
-	s := segment{
+func (l *Log) cycle() error {
+	if err := l.sfile.Sync(); err != nil {
+		return err
+	}
+	if err := l.sfile.Close(); err != nil {
+		return err
+	}
+	// cache the previous segement
+	l.pushCache(len(l.segments) - 1)
+	s := &segment{
 		index: l.lastIndex + 1,
 		path:  filepath.Join(l.path, segmentName(l.lastIndex+1)),
 	}
-	l.file = must(os.Create(s.path)).(*os.File)
-	l.fileSize = 0
-	l.segments = append(l.segments, s)
-	l.buffer = nil
-}
-
-// appendEntry to the log buffer. This also increases the log segment fileSize.
-func (l *Log) appendEntry(index uint64, data []byte) {
-	mark := len(l.buffer)
-	if l.opts.LogFormat == JSON {
-		l.buffer = appendJSONEntry(l.buffer, index, data)
-	} else {
-		l.buffer = appendBinaryEntry(l.buffer, index, data)
+	var err error
+	l.sfile, err = os.Create(s.path)
+	if err != nil {
+		return err
 	}
-	l.fileSize += len(l.buffer) - mark
-
+	l.segments = append(l.segments, s)
+	return nil
 }
 
-func appendJSONEntry(dst []byte, index uint64, data []byte) []byte {
+func appendJSONEntry(dst []byte, index uint64, data []byte) (out []byte,
+	epos bpos) {
 	// {"index":number,"data":string}
+	mark := len(dst)
 	dst = append(dst, `{"index":"`...)
 	dst = strconv.AppendUint(dst, index, 10)
 	dst = append(dst, `","data":`...)
 	dst = appendJSONData(dst, data)
 	dst = append(dst, '}', '\n')
-	return dst
+	return dst, bpos{mark, len(dst)}
 }
 
 func appendJSONData(dst []byte, s []byte) []byte {
@@ -362,12 +356,12 @@ func appendJSONData(dst []byte, s []byte) []byte {
 	return append(dst, '"')
 }
 
-func appendBinaryEntry(dst []byte, index uint64, data []byte) []byte {
-	// index + data_size + data
-	dst = appendUvarint(dst, index)
+func appendBinaryEntry(dst []byte, data []byte) (out []byte, epos bpos) {
+	// data_size + data
+	pos := len(dst)
 	dst = appendUvarint(dst, uint64(len(data)))
 	dst = append(dst, data...)
-	return dst
+	return dst, bpos{pos, len(dst)}
 }
 
 func appendUvarint(dst []byte, x uint64) []byte {
@@ -379,53 +373,92 @@ func appendUvarint(dst []byte, x uint64) []byte {
 
 // Batch of entries. Used to write multiple entries at once using WriteBatch().
 type Batch struct {
-	indexes   []uint64
-	dataSizes []int
-	datas     []byte
+	entries []batchEntry
+	datas   []byte
+}
+
+type batchEntry struct {
+	index uint64
+	size  int
 }
 
 // Write an entry to the batch
 func (b *Batch) Write(index uint64, data []byte) {
-	b.indexes = append(b.indexes, index)
-	b.dataSizes = append(b.dataSizes, len(data))
+	b.entries = append(b.entries, batchEntry{index, len(data)})
 	b.datas = append(b.datas, data...)
 }
 
 // Clear the batch for reuse.
 func (b *Batch) Clear() {
-	b.indexes = b.indexes[:0]
-	b.dataSizes = b.dataSizes[:0]
+	b.entries = b.entries[:0]
 	b.datas = b.datas[:0]
 }
 
 // WriteBatch writes the entries in the batch to the log in the order that they
 // were added to the batch. The batch is cleared upon a successful return.
 func (l *Log) WriteBatch(b *Batch) error {
-	if l.closed {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.corrupt {
+		return ErrCorrupt
+	} else if l.closed {
 		return ErrClosed
 	}
-	if len(b.indexes) == 0 {
+	if len(b.entries) == 0 {
 		return nil
 	}
-	// check all indexes in batch
-	for i := 0; i < len(b.indexes); i++ {
-		if b.indexes[i] != l.lastIndex+uint64(i+1) {
+	return l.writeBatch(b)
+}
+
+func (l *Log) writeBatch(b *Batch) error {
+	// check that all indexes in batch are sane
+	for i := 0; i < len(b.entries); i++ {
+		if b.entries[i].index != l.lastIndex+uint64(i+1) {
 			return ErrOutOfOrder
 		}
 	}
-	if l.fileSize >= l.opts.SegmentSize {
-		l.cycle()
+	// load the tail segment
+	s := l.segments[len(l.segments)-1]
+	if len(s.ebuf) > l.opts.SegmentSize {
+		// tail segment has reached capacity. Close it and create a new one.
+		if err := l.cycle(); err != nil {
+			return err
+		}
+		s = l.segments[len(l.segments)-1]
 	}
+
+	mark := len(s.ebuf)
 	datas := b.datas
-	for i := 0; i < len(b.indexes); i++ {
-		data := datas[:b.dataSizes[i]]
-		l.appendEntry(b.indexes[i], data)
-		datas = datas[b.dataSizes[i]:]
+	for i := 0; i < len(b.entries); i++ {
+		data := datas[:b.entries[i].size]
+		var epos bpos
+		s.ebuf, epos = l.appendEntry(s.ebuf, b.entries[i].index, data)
+		s.epos = append(s.epos, epos)
+		if len(s.ebuf) >= l.opts.SegmentSize {
+			// segment has reached capacity, cycle now
+			if _, err := l.sfile.Write(s.ebuf[mark:]); err != nil {
+				return err
+			}
+			l.lastIndex = b.entries[i].index
+			if err := l.cycle(); err != nil {
+				return err
+			}
+			s = l.segments[len(l.segments)-1]
+			mark = 0
+		}
+		datas = datas[b.entries[i].size:]
 	}
-	if l.opts.Durability >= Medium || len(l.buffer) >= 4096 {
-		l.flush()
+	if len(s.ebuf)-mark > 0 {
+		if _, err := l.sfile.Write(s.ebuf[mark:]); err != nil {
+			return err
+		}
+		l.lastIndex = b.entries[len(b.entries)-1].index
 	}
-	l.lastIndex = b.indexes[len(b.indexes)-1]
+	if !l.opts.NoSync {
+		if err := l.sfile.Sync(); err != nil {
+			return err
+		}
+	}
 	b.Clear()
 	return nil
 }
@@ -433,7 +466,11 @@ func (l *Log) WriteBatch(b *Batch) error {
 // FirstIndex returns the index of the first entry in the log. Returns zero
 // when log has no entries.
 func (l *Log) FirstIndex() (index uint64, err error) {
-	if l.closed {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.corrupt {
+		return 0, ErrCorrupt
+	} else if l.closed {
 		return 0, ErrClosed
 	}
 	// We check the lastIndex for zero because the firstIndex is always one or
@@ -447,7 +484,11 @@ func (l *Log) FirstIndex() (index uint64, err error) {
 // LastIndex returns the index of the last entry in the log. Returns zero when
 // log has no entries.
 func (l *Log) LastIndex() (index uint64, err error) {
-	if l.closed {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.corrupt {
+		return 0, ErrCorrupt
+	} else if l.closed {
 		return 0, ErrClosed
 	}
 	if l.lastIndex == 0 {
@@ -470,425 +511,385 @@ func (l *Log) findSegment(index uint64) int {
 	return i - 1
 }
 
-// Read an entry from the log. This function reads an entry from disk and is
-// optimized for sequential reads. Randomly accessing entries is slow.
+func (l *Log) loadSegmentEntries(s *segment) error {
+	data, err := ioutil.ReadFile(s.path)
+	if err != nil {
+		return err
+	}
+	ebuf := data
+	var epos []bpos
+	var pos int
+	for exidx := s.index; len(data) > 0; exidx++ {
+		var n int
+		if l.opts.LogFormat == JSON {
+			n, err = loadNextJSONEntry(data)
+		} else {
+			n, err = loadNextBinaryEntry(data)
+		}
+		if err != nil {
+			return err
+		}
+		data = data[n:]
+		epos = append(epos, bpos{pos, pos + n})
+		pos += n
+	}
+	s.ebuf = ebuf
+	s.epos = epos
+	return nil
+}
+
+func loadNextJSONEntry(data []byte) (n int, err error) {
+	// {"index":number,"data":string}
+	idx := bytes.IndexByte(data, '\n')
+	if idx == -1 {
+		return 0, ErrCorrupt
+	}
+	line := data[:idx]
+	dres := gjson.Get(*(*string)(unsafe.Pointer(&line)), "data")
+	if dres.Type != gjson.String {
+		return 0, ErrCorrupt
+	}
+	return idx + 1, nil
+}
+
+func loadNextBinaryEntry(data []byte) (n int, err error) {
+	// data_size + data
+	size, n := binary.Uvarint(data)
+	if n <= 0 {
+		return 0, ErrCorrupt
+	}
+	if uint64(len(data)-n) < size {
+		return 0, ErrCorrupt
+	}
+	return n + int(size), nil
+}
+
+// loadSegment loads the segment entries into memory, pushes it to the front
+// of the lru cache, and returns it.
+func (l *Log) loadSegment(index uint64) (*segment, error) {
+	// check the last segment first.
+	lseg := l.segments[len(l.segments)-1]
+	if index >= lseg.index {
+		return lseg, nil
+	}
+	// check the most recent cached segment
+	var rseg *segment
+	l.scache.Range(func(_, v interface{}) bool {
+		s := v.(*segment)
+		if index >= s.index && index < s.index+uint64(len(s.epos)) {
+			rseg = s
+		}
+		return false
+	})
+	if rseg != nil {
+		return rseg, nil
+	}
+	// find in the segment array
+	idx := l.findSegment(index)
+	s := l.segments[idx]
+	if len(s.epos) == 0 {
+		// load the entries from cache
+		if err := l.loadSegmentEntries(s); err != nil {
+			return nil, err
+		}
+	}
+	// push the segment to the front of the cache
+	l.pushCache(idx)
+	return s, nil
+}
+
+// Read an entry from the log. Returns a byte slice containing the data entry.
 func (l *Log) Read(index uint64) (data []byte, err error) {
-	if l.closed {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.corrupt {
+		return nil, ErrCorrupt
+	} else if l.closed {
 		return nil, ErrClosed
 	}
 	if index == 0 || index < l.firstIndex || index > l.lastIndex {
 		return nil, ErrNotFound
 	}
-
-	// find an opened reader
-	var r *reader
-	for _, or := range l.readers {
-		if or.nindex == index {
-			r = or
-			break
-		}
-	}
-	if r == nil {
-		// Reader not found, open a new reader and return the entry at index
-		return l.openReader(index)
-	}
-
-	// Read next entry from reader
-	for {
-		eindex, edata, err := l.readEntry(r)
-		if err == io.EOF {
-			// Reached the end of the segment.
-			if r.sindex == len(l.segments)-1 {
-				// At the end of the last segment file.
-				if len(l.buffer) > 0 {
-					// But the segment has a buffer, flush it and try again
-					must(l.file.Write(l.buffer))
-					l.buffer = l.buffer[:0]
-					continue
-				}
-				// Log is missing some final entries, consider is corrput
-				l.closeReader(r)
-				return nil, ErrCorrupt
-			}
-			// Close the old reader and open a new one
-			l.closeReader(r)
-			return l.openReader(index)
-		}
-		if eindex != index {
-			// Log has gaps or is out of order, corrupt file.
-			l.closeReader(r)
-			return nil, ErrCorrupt
-		}
-		r.nindex++
-		if r.nindex == l.lastIndex+1 {
-			// read the last entry, close the reader
-			l.closeReader(r)
-		}
-		return edata, nil
-	}
-}
-
-// openReader opens a new reader and returns the data belong to entry at index.
-func (l *Log) openReader(index uint64) (data []byte, err error) {
-	// reader not found, open a new one
-	r := &reader{}
-	r.sindex = l.findSegment(index)
-	r.nindex = l.segments[r.sindex].index
-	r.file, err = os.Open(l.segments[r.sindex].path)
+	s, err := l.loadSegment(index)
 	if err != nil {
 		return nil, err
 	}
-	r.rd = bufio.NewReader(r.file)
-	if r.sindex == len(l.segments)-1 {
-		if len(l.buffer) > 0 {
-			// Reading from the last segment, which has a buffer, flush the
-			// buffer before reading from file.
-			must(l.file.Write(l.buffer))
-			l.buffer = l.buffer[:0]
-		}
-	}
-	// Scan the file for the entry at index.
-	for {
-		eindex, edata, err := l.readEntry(r)
-		if err != nil {
-			// Bad news. Likely a corrupt file.
-			r.file.Close()
-			return nil, err
-		}
-		if eindex != r.nindex {
-			// Log has gaps or is out of order, corrupt file.
-			r.file.Close()
+	epos := s.epos[index-s.index]
+	edata := s.ebuf[epos.pos:epos.end]
+	if l.opts.LogFormat == JSON {
+		s := gjson.Get(*(*string)(unsafe.Pointer(&edata)), "data").String()
+		if len(s) > 0 && s[0] == '$' {
+			var err error
+			data, err = base64.URLEncoding.DecodeString(s[1:])
+			if err != nil {
+				return nil, ErrCorrupt
+			}
+		} else if len(s) > 0 && s[0] == '+' {
+			data = make([]byte, len(s[1:]))
+			copy(data, s[1:])
+		} else {
 			return nil, ErrCorrupt
 		}
-		r.nindex = eindex + 1
-		if eindex == index {
-			// Add the new reader to the front of the list of opened readers.
-			l.readers = append(l.readers, nil)
-			copy(l.readers[1:], l.readers[:len(l.readers)-1])
-			l.readers[0] = r
-			for len(l.readers) > maxReaders {
-				// remove the oldest readers
-				l.closeReader(l.readers[len(l.readers)-1])
-			}
-			return edata, nil
-		}
-	}
-}
-
-// closeReader closes the reader and removes it from the list of opened readers.
-func (l *Log) closeReader(r *reader) {
-	for i, rr := range l.readers {
-		if rr == r {
-			must(nil, r.file.Close())
-			l.readers[i] = l.readers[len(l.readers)-1]
-			l.readers[len(l.readers)-1] = nil
-			l.readers = l.readers[:len(l.readers)-1]
-			return
-		}
-	}
-}
-
-// readEntry reads the next entry from reader. Returns io.EOF if the readers
-// has reached the end of a segment.
-func (l *Log) readEntry(r *reader) (index uint64, data []byte, err error) {
-	return readEntry(r.rd, l.opts.LogFormat, false)
-}
-
-// readEntry from bufio.Reader. The discardData param will discard the entry
-// data ane return nil.
-func readEntry(rd *bufio.Reader, frmt LogFormat, discardData bool) (
-	index uint64, data []byte, err error,
-) {
-	if frmt == JSON {
-		line, err := rd.ReadBytes('\n')
-		if err != nil {
-			if err == io.EOF && len(line) > 0 {
-				return 0, nil, ErrCorrupt
-			}
-			return 0, nil, err
-		}
-		var m map[string]string
-		if err := json.Unmarshal(line, &m); err != nil {
-			return 0, nil, ErrCorrupt
-		}
-		index, err = strconv.ParseUint(m["index"], 10, 64)
-		if err != nil {
-			return 0, nil, ErrCorrupt
-		}
-		s, ok := m["data"]
-		if !ok || len(s) == 0 {
-			return 0, nil, ErrCorrupt
-		}
-		if !discardData {
-			switch s[0] {
-			case '$':
-				data, err = base64.URLEncoding.DecodeString(s[1:])
-				if err != nil {
-					return 0, nil, ErrCorrupt
-				}
-			case '+':
-				data = []byte(s[1:])
-			default:
-				return 0, nil, ErrCorrupt
-			}
-		}
-		return index, data, nil
-	}
-	index, err = binary.ReadUvarint(rd)
-	if err != nil {
-		return 0, nil, err
-	}
-	dataSize, err := binary.ReadUvarint(rd)
-	if err != nil {
-		if err == io.EOF {
-			return 0, nil, ErrCorrupt
-		}
-		return 0, nil, err
-	}
-	if discardData {
-		_, err = rd.Discard(int(dataSize))
 	} else {
-		data = make([]byte, dataSize)
-		_, err = io.ReadFull(rd, data)
-	}
-	if err != nil {
-		if err == io.EOF {
-			return 0, nil, ErrCorrupt
+		size, n := binary.Uvarint(edata)
+		if n <= 0 {
+			return nil, ErrCorrupt
 		}
-		return 0, nil, err
+		if uint64(len(edata)-n) < size {
+			return nil, ErrCorrupt
+		}
+		data = make([]byte, size)
+		copy(data, edata[n:])
 	}
-	return index, data, nil
+	return data, nil
+}
+
+// ClearCache clears the segment cache
+func (l *Log) ClearCache() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.corrupt {
+		return ErrCorrupt
+	} else if l.closed {
+		return ErrClosed
+	}
+	l.clearCache()
+	return nil
+}
+func (l *Log) clearCache() {
+	l.scache.Range(func(_, v interface{}) bool {
+		s := v.(*segment)
+		s.ebuf = nil
+		s.epos = nil
+		return true
+	})
+	l.scache = tinylru.LRU{}
+	l.scache.Resize(l.opts.SegmentCacheSize)
 }
 
 // TruncateFront truncates the front of the log by removing all entries that
-// are before the provided `firstIndex`. In other words the entry at
-// `firstIndex` becomes the first entry in the log.
-func (l *Log) TruncateFront(firstIndex uint64) error {
-	if l.closed {
+// are before the provided `index`. In other words the entry at
+// `index` becomes the first entry in the log.
+func (l *Log) TruncateFront(index uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.corrupt {
+		return ErrCorrupt
+	} else if l.closed {
 		return ErrClosed
 	}
-
-	index := firstIndex // alias
-
+	return l.truncateFront(index)
+}
+func (l *Log) truncateFront(index uint64) (err error) {
 	if index == 0 || l.lastIndex == 0 ||
 		index < l.firstIndex || index > l.lastIndex {
 		return ErrOutOfRange
 	}
-
-	// Flush the buffer, if needed.
-	if len(l.buffer) > 0 {
-		must(l.file.Write(l.buffer))
-		l.buffer = nil
-	}
-	// Close all readers
-	for len(l.readers) > 0 {
-		l.closeReader(l.readers[0])
-	}
-
 	if index == l.firstIndex {
 		// nothing to truncate
 		return nil
 	}
-
-	// Find which segment has the entry with the index.
-	sidx := l.findSegment(index)
-	// Find the file offset of the first byte belonging to the entry at index.
-	f, err := os.Open(l.segments[sidx].path)
+	segIdx := l.findSegment(index)
+	var s *segment
+	s, err = l.loadSegment(index)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	if index > l.segments[sidx].index {
-		// Read all entries prior to entry at index.
-		rd := bufio.NewReader(f)
-		var found bool
-		for {
-			ridx, _, err := readEntry(rd, l.opts.LogFormat, true)
-			if err != nil {
-				return err
-			}
-			if ridx == index-1 {
-				// Seek to exact position of entry, the reader likely overread
-				// the file, so we need to back up what has been buffered.
-				if _, err := f.Seek(0-int64(rd.Buffered()), 1); err != nil {
-					return err
-				}
-				found = true
-				break
-			}
-		}
-		if !found {
-			return ErrCorrupt
-		}
-	}
-	// Create a temp file in the same log directory and copy all of the data
-	// starting at the seeked offset position.
+	epos := s.epos[index-s.index:]
+	ebuf := s.ebuf[epos[0].pos:]
+	// Create a temp file contains the truncated segment.
 	tempName := filepath.Join(l.path, "TEMP")
-	ftmp, err := os.Create(tempName)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		ftmp.Close()
-		os.Remove(tempName)
+	err = func() error {
+		f, err := os.Create(tempName)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		if _, err := f.Write(ebuf); err != nil {
+			return err
+		}
+		if err := f.Sync(); err != nil {
+			return err
+		}
+		return f.Close()
 	}()
-	if _, err := io.Copy(ftmp, f); err != nil {
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := ftmp.Close(); err != nil {
-		return err
-	}
-	// Then rename the TEMP file to it's START file name.
+	// Rename the TEMP file to it's START file name.
 	startName := filepath.Join(l.path, segmentName(index)+".START")
-	if err := os.Rename(tempName, startName); err != nil {
+	if err = os.Rename(tempName, startName); err != nil {
 		return err
 	}
-	// All operations from this point on are syscalls and must succeed,
-	// otherwise we panic.
-	// Remove all of the unneeded segments.
-	for i := 0; i <= sidx; i++ {
-		must(nil, os.Remove(l.segments[i].path))
+	// The log was truncated but still needs some file cleanup. Any errors
+	// following this message will not cause an on-disk data ocorruption, but
+	// may cause an inconsistency with the current program, so we'll return
+	// ErrCorrupt so the the user can attempt a recover by calling Close()
+	// followed by Open().
+	defer func() {
+		if v := recover(); v != nil {
+			err = ErrCorrupt
+			l.corrupt = true
+		}
+	}()
+	if segIdx == len(l.segments)-1 {
+		// Close the tail segment file
+		if err = l.sfile.Close(); err != nil {
+			return err
+		}
 	}
-	// Remove the ".START" suffix from the file name.
-	finalName := startName[:len(startName)-len(".START")]
-	must(nil, os.Rename(startName, finalName))
-	// Modify the segments list.
-	l.segments = append([]segment{segment{path: finalName, index: index}},
-		l.segments[sidx+1:]...)
-	if len(l.segments) == 1 {
-		// The last segment has been changed which means we need to reopen the
-		// appendable file and seek to the end.
-		must(nil, l.file.Close())
-		l.file = must(os.OpenFile(finalName, os.O_RDWR, 0666)).(*os.File)
-		l.fileSize = int(must(l.file.Seek(0, 2)).(int64))
-		l.buffer = nil
+	// Delete truncated segment files
+	for i := 0; i <= segIdx; i++ {
+		if err = os.Remove(l.segments[i].path); err != nil {
+			return err
+		}
 	}
+	// Rename the START file to the final truncated segment name.
+	newName := filepath.Join(l.path, segmentName(index))
+	if os.Rename(startName, newName); err != nil {
+		return err
+	}
+	s.path = newName
+	s.index = index
+	if segIdx == len(l.segments)-1 {
+		// Reopen the tail segment file
+		if l.sfile, err = os.OpenFile(newName, os.O_WRONLY, 0666); err != nil {
+			return err
+		}
+		var n int64
+		if n, err = l.sfile.Seek(0, 2); err != nil {
+			return err
+		}
+		if n != int64(len(ebuf)) {
+			err = errors.New("invalid seek")
+			return err
+		}
+		// Load the last segment entries
+		if err = l.loadSegmentEntries(s); err != nil {
+			return err
+		}
+	}
+	l.segments = append([]*segment{}, l.segments[segIdx:]...)
 	l.firstIndex = index
+	l.clearCache()
 	return nil
 }
 
 // TruncateBack truncates the back of the log by removing all entries that
-// are after the provided `lastIndex`. In other words the entry at `lastIndex`
+// are after the provided `index`. In other words the entry at `index`
 // becomes the last entry in the log.
-func (l *Log) TruncateBack(lastIndex uint64) error {
-	if l.closed {
+func (l *Log) TruncateBack(index uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.corrupt {
+		return ErrCorrupt
+	} else if l.closed {
 		return ErrClosed
 	}
+	return l.truncateBack(index)
+}
 
-	index := lastIndex // alias
-
+func (l *Log) truncateBack(index uint64) (err error) {
 	if index == 0 || l.lastIndex == 0 ||
-		index > l.lastIndex || index < l.firstIndex {
+		index < l.firstIndex || index > l.lastIndex {
 		return ErrOutOfRange
 	}
-
-	// Flush the buffer, if needed.
-	if len(l.buffer) > 0 {
-		must(l.file.Write(l.buffer))
-		l.buffer = nil
-	}
-	// Close all readers
-	for len(l.readers) > 0 {
-		l.closeReader(l.readers[0])
-	}
-
 	if index == l.lastIndex {
 		// nothing to truncate
 		return nil
 	}
-
-	// Find which segment has the entry with the index.
-	sidx := l.findSegment(index)
-	// Find the file offset of the first byte belonging to the entry at index.
-	f, err := os.Open(l.segments[sidx].path)
+	segIdx := l.findSegment(index)
+	var s *segment
+	s, err = l.loadSegment(index)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	// Read all entries prior to entry at index.
-	rd := bufio.NewReader(f)
-	var found bool
-	var offset int64
-	for {
-		ridx, _, err := readEntry(rd, l.opts.LogFormat, true)
+	epos := s.epos[:index-s.index+1]
+	ebuf := s.ebuf[:epos[len(epos)-1].end]
+	// Create a temp file contains the truncated segment.
+	tempName := filepath.Join(l.path, "TEMP")
+	err = func() error {
+		f, err := os.Create(tempName)
 		if err != nil {
 			return err
 		}
-		if ridx == index {
-			// Seek to exact position of entry, the reader likely overread
-			// the file, so we need to back up what has been buffered.
-			offset, err = f.Seek(0-int64(rd.Buffered()), 1)
-			if err != nil {
-				return err
-			}
-			found = true
-			// Rewind the segment
-			if _, err := f.Seek(0, 0); err != nil {
-				return err
-			}
-			break
+		defer f.Close()
+		if _, err := f.Write(ebuf); err != nil {
+			return err
+		}
+		if err := f.Sync(); err != nil {
+			return err
+		}
+		return f.Close()
+	}()
+	// Rename the TEMP file to it's END file name.
+	endName := filepath.Join(l.path, segmentName(s.index)+".END")
+	if err = os.Rename(tempName, endName); err != nil {
+		return err
+	}
+	// The log was truncated but still needs some file cleanup. Any errors
+	// following this message will not cause an on-disk data ocorruption, but
+	// may cause an inconsistency with the current program, so we'll return
+	// ErrCorrupt so the the user can attempt a recover by calling Close()
+	// followed by Open().
+	defer func() {
+		if v := recover(); v != nil {
+			err = ErrCorrupt
+			l.corrupt = true
+		}
+	}()
+
+	// Close the tail segment file
+	if err = l.sfile.Close(); err != nil {
+		return err
+	}
+	// Delete truncated segment files
+	for i := segIdx; i < len(l.segments); i++ {
+		if err = os.Remove(l.segments[i].path); err != nil {
+			return err
 		}
 	}
-	if !found {
-		return ErrCorrupt
+	// Rename the END file to the final truncated segment name.
+	newName := filepath.Join(l.path, segmentName(s.index))
+	if err = os.Rename(endName, newName); err != nil {
+		return err
 	}
-	// Create a temp file in the same log directory and copy all of the data
-	// up to the offset.
-	tempName := filepath.Join(l.path, "TEMP")
-	ftmp, err := os.Create(tempName)
+	// Reopen the tail segment file
+	if l.sfile, err = os.OpenFile(newName, os.O_WRONLY, 0666); err != nil {
+		return err
+	}
+	var n int64
+	n, err = l.sfile.Seek(0, 2)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		ftmp.Close()
-		os.Remove(tempName)
-	}()
-	if _, err := io.CopyN(ftmp, f, offset); err != nil {
+	if n != int64(len(ebuf)) {
+		err = errors.New("invalid seek")
 		return err
 	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := ftmp.Close(); err != nil {
-		return err
-	}
-	// Then rename the TEMP file to it's END file name.
-	endName := l.segments[sidx].path + ".END"
-	if err := os.Rename(tempName, endName); err != nil {
-		return err
-	}
-	// All operations from this point on are syscalls and must succeed,
-	// otherwise we panic.
-	// Remove all of the unneeded segments.
-	for i := len(l.segments) - 1; i >= sidx; i-- {
-		must(nil, os.Remove(l.segments[i].path))
-	}
-	// Modify the segments list.
-	l.segments = append([]segment{}, l.segments[:sidx+1]...)
-	// Remove the ".END" suffix from the file name.
-	finalName := endName[:len(endName)-len(".END")]
-	must(nil, os.Rename(endName, finalName))
-	// The last segment has been changed which means we need to reopen the
-	// appendable file and seek to the end.
-	must(nil, l.file.Close())
-	l.file = must(os.OpenFile(finalName, os.O_RDWR, 0666)).(*os.File)
-	l.fileSize = int(must(l.file.Seek(0, 2)).(int64))
-	l.buffer = nil
+	s.path = newName
+	l.segments = append([]*segment{}, l.segments[:segIdx+1]...)
 	l.lastIndex = index
+	l.clearCache()
+	if err = l.loadSegmentEntries(s); err != nil {
+		return err
+	}
 	return nil
 }
 
 // Sync performs an fsync on the log. This is not necessary when the
-// durability is set to High.
-func (l *Log) Sync() {
-	if len(l.buffer) > 0 {
-		must(l.file.Write(l.buffer))
-		l.buffer = l.buffer[:0]
+// NoSync option is set to false.
+func (l *Log) Sync() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.corrupt {
+		return ErrCorrupt
+	} else if l.closed {
+		return ErrClosed
 	}
-	if l.opts.Durability < High {
-		must(nil, l.file.Sync())
+	return l.sfile.Sync()
+}
+
+func must(v interface{}, err error) interface{} {
+	if err != nil {
+		panic(err)
 	}
+	return v
 }

@@ -1,9 +1,7 @@
 package wal
 
 import (
-	"bufio"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"math/rand"
 	"os"
@@ -181,13 +179,12 @@ func testLog(t *testing.T, opts *Options, N int) {
 	for i := 1; i <= N; i++ {
 		data, err := l.Read(uint64(i))
 		if err != nil {
-			t.Fatalf("error while getting %d", i)
+			t.Fatalf("error while getting %d, err=%s", i, err)
 		}
 		if string(data) != dataStr(uint64(i)) {
 			t.Fatalf("expected %s, got %s", dataStr(uint64(i)), data)
 		}
 	}
-
 	// FirstIndex/LastIndex -- check valid first and last indexes
 	n, err = l.FirstIndex()
 	if err != nil {
@@ -203,7 +200,6 @@ func testLog(t *testing.T, opts *Options, N int) {
 	if n != uint64(N) {
 		t.Fatalf("expected %d, got %d", N, n)
 	}
-
 	// Write -- add 50 more items
 	for i := N + 1; i <= N+50; i++ {
 		index := uint64(i)
@@ -219,7 +215,6 @@ func testLog(t *testing.T, opts *Options, N int) {
 		}
 	}
 	N += 50
-
 	// FirstIndex/LastIndex -- check valid first and last indexes
 	n, err = l.FirstIndex()
 	if err != nil {
@@ -235,7 +230,6 @@ func testLog(t *testing.T, opts *Options, N int) {
 	if n != uint64(N) {
 		t.Fatalf("expected %d, got %d", N, n)
 	}
-
 	// Batch -- test batch writes
 	b := new(Batch)
 	b.Write(1, nil)
@@ -265,7 +259,6 @@ func testLog(t *testing.T, opts *Options, N int) {
 		}
 		N += 10
 	}
-
 	// Read -- read back all entries
 	for i := 1; i <= N; i++ {
 		data, err := l.Read(uint64(i))
@@ -283,7 +276,6 @@ func testLog(t *testing.T, opts *Options, N int) {
 		t.Fatal(err)
 	}
 	N++
-
 	// Read -- one random read, so there is an opened reader
 	data, err := l.Read(uint64(N / 2))
 	if err != nil {
@@ -299,7 +291,7 @@ func testLog(t *testing.T, opts *Options, N int) {
 		if err = l.TruncateFront(index); err != ErrOutOfRange {
 			t.Fatalf("expected %v, got %v", ErrOutOfRange, err)
 		}
-		testFirstLast(t, l, uint64(1), uint64(N))
+		testFirstLast(t, l, uint64(1), uint64(N), nil)
 	}
 
 	// TruncateBack -- should fail, out of range
@@ -307,19 +299,19 @@ func testLog(t *testing.T, opts *Options, N int) {
 	if err != ErrOutOfRange {
 		t.Fatalf("expected %v, got %v", ErrOutOfRange, err)
 	}
-	testFirstLast(t, l, uint64(1), uint64(N))
+	testFirstLast(t, l, uint64(1), uint64(N), nil)
 
 	// TruncateFront -- Remove no entries
 	if err = l.TruncateFront(1); err != nil {
 		t.Fatal(err)
 	}
-	testFirstLast(t, l, uint64(1), uint64(N))
+	testFirstLast(t, l, uint64(1), uint64(N), nil)
 
 	// TruncateFront -- Remove first 80 entries
 	if err = l.TruncateFront(81); err != nil {
 		t.Fatal(err)
 	}
-	testFirstLast(t, l, uint64(81), uint64(N))
+	testFirstLast(t, l, uint64(81), uint64(N), nil)
 
 	// Write -- one entry, so the buffer might be activated
 	err = l.Write(uint64(N+1), []byte(dataStr(uint64(N+1))))
@@ -327,7 +319,7 @@ func testLog(t *testing.T, opts *Options, N int) {
 		t.Fatal(err)
 	}
 	N++
-	testFirstLast(t, l, uint64(81), uint64(N))
+	testFirstLast(t, l, uint64(81), uint64(N), nil)
 
 	// Read -- one random read, so there is an opened reader
 	data, err = l.Read(uint64(N / 2))
@@ -344,21 +336,20 @@ func testLog(t *testing.T, opts *Options, N int) {
 		if err = l.TruncateBack(index); err != ErrOutOfRange {
 			t.Fatalf("expected %v, got %v", ErrOutOfRange, err)
 		}
-		testFirstLast(t, l, uint64(81), uint64(N))
+		testFirstLast(t, l, uint64(81), uint64(N), nil)
 	}
 
 	// TruncateBack -- Remove no entries
 	if err = l.TruncateBack(uint64(N)); err != nil {
 		t.Fatal(err)
 	}
-	testFirstLast(t, l, uint64(81), uint64(N))
-
+	testFirstLast(t, l, uint64(81), uint64(N), nil)
 	// TruncateBack -- Remove last 80 entries
 	if err = l.TruncateBack(uint64(N - 80)); err != nil {
 		t.Fatal(err)
 	}
 	N -= 80
-	testFirstLast(t, l, uint64(81), uint64(N))
+	testFirstLast(t, l, uint64(81), uint64(N), nil)
 
 	// Read -- read back all entries
 	for i := 81; i <= N; i++ {
@@ -383,7 +374,7 @@ func testLog(t *testing.T, opts *Options, N int) {
 	}
 	defer l.Close()
 
-	testFirstLast(t, l, uint64(81), uint64(N))
+	testFirstLast(t, l, uint64(81), uint64(N), nil)
 
 	// Read -- read back all entries
 	for i := 81; i <= N; i++ {
@@ -400,7 +391,7 @@ func testLog(t *testing.T, opts *Options, N int) {
 	if err = l.TruncateFront(uint64(N)); err != nil {
 		t.Fatal(err)
 	}
-	testFirstLast(t, l, uint64(N), uint64(N))
+	testFirstLast(t, l, uint64(N), uint64(N), nil)
 
 	// Write -- write on entry
 	err = l.Write(uint64(N+1), []byte(dataStr(uint64(N+1))))
@@ -408,14 +399,14 @@ func testLog(t *testing.T, opts *Options, N int) {
 		t.Fatal(err)
 	}
 	N++
-	testFirstLast(t, l, uint64(N-1), uint64(N))
+	testFirstLast(t, l, uint64(N-1), uint64(N), nil)
 
 	// TruncateBack -- truncate all entries but one
 	if err = l.TruncateBack(uint64(N - 1)); err != nil {
 		t.Fatal(err)
 	}
 	N--
-	testFirstLast(t, l, uint64(N), uint64(N))
+	testFirstLast(t, l, uint64(N), uint64(N), nil)
 
 	if err = l.Write(uint64(N+1), []byte(dataStr(uint64(N+1)))); err != nil {
 		t.Fatal(err)
@@ -423,11 +414,10 @@ func testLog(t *testing.T, opts *Options, N int) {
 	N++
 
 	l.Sync()
-	testFirstLast(t, l, uint64(N-1), uint64(N))
-
+	testFirstLast(t, l, uint64(N-1), uint64(N), nil)
 }
 
-func testFirstLast(t *testing.T, l *Log, expectFirst, expectLast uint64) {
+func testFirstLast(t *testing.T, l *Log, expectFirst, expectLast uint64, data func(index uint64) []byte) {
 	t.Helper()
 	fi, err := l.FirstIndex()
 	if err != nil {
@@ -440,6 +430,19 @@ func testFirstLast(t *testing.T, l *Log, expectFirst, expectLast uint64) {
 	if fi != expectFirst || li != expectLast {
 		t.Fatalf("expected %v/%v, got %v/%v", expectFirst, expectLast, fi, li)
 	}
+	for i := fi; i <= li; i++ {
+		dt1, err := l.Read(i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if data != nil {
+			dt2 := data(i)
+			if string(dt1) != string(dt2) {
+				t.Fatalf("mismatch '%s' != '%s'", dt2, dt1)
+			}
+		}
+	}
+
 }
 
 func TestLog(t *testing.T) {
@@ -449,28 +452,20 @@ func TestLog(t *testing.T) {
 	t.Run("nil-opts", func(t *testing.T) {
 		testLog(t, nil, 100)
 	})
-	t.Run("low", func(t *testing.T) {
+	t.Run("no-sync", func(t *testing.T) {
 		t.Run("json", func(t *testing.T) {
-			testLog(t, makeOpts(512, Low, JSON), 100)
+			testLog(t, makeOpts(512, true, JSON), 100)
 		})
 		t.Run("binary", func(t *testing.T) {
-			testLog(t, makeOpts(512, Low, Binary), 100)
+			testLog(t, makeOpts(512, true, Binary), 100)
 		})
 	})
-	t.Run("medium", func(t *testing.T) {
+	t.Run("sync", func(t *testing.T) {
 		t.Run("json", func(t *testing.T) {
-			testLog(t, makeOpts(512, Medium, JSON), 100)
+			testLog(t, makeOpts(512, false, JSON), 100)
 		})
 		t.Run("binary", func(t *testing.T) {
-			testLog(t, makeOpts(512, Medium, Binary), 100)
-		})
-	})
-	t.Run("high", func(t *testing.T) {
-		t.Run("json", func(t *testing.T) {
-			testLog(t, makeOpts(512, High, JSON), 100)
-		})
-		t.Run("binary", func(t *testing.T) {
-			testLog(t, makeOpts(512, High, Binary), 100)
+			testLog(t, makeOpts(512, false, Binary), 100)
 		})
 	})
 }
@@ -522,7 +517,7 @@ func TestOutliers(t *testing.T) {
 
 	t.Run("fail-corrupted-tail-json", func(t *testing.T) {
 		defer os.RemoveAll("testlog/corrupt-tail")
-		opts := makeOpts(512, Medium, JSON)
+		opts := makeOpts(512, true, JSON)
 		os.MkdirAll("testlog/corrupt-tail", 0777)
 		ioutil.WriteFile(
 			"testlog/corrupt-tail/00000000000000000001",
@@ -556,7 +551,7 @@ func TestOutliers(t *testing.T) {
 
 	t.Run("start-marker-file", func(t *testing.T) {
 		lpath := "testlog/start-marker"
-		opts := makeOpts(512, Medium, JSON)
+		opts := makeOpts(512, true, JSON)
 		l := must(Open(lpath, opts)).(*Log)
 		defer l.Close()
 		for i := uint64(1); i <= 100; i++ {
@@ -569,47 +564,46 @@ func TestOutliers(t *testing.T) {
 		must(nil, ioutil.WriteFile(path+".START", data, 0666))
 		l = must(Open(lpath, opts)).(*Log)
 		defer l.Close()
-		testFirstLast(t, l, firstIndex, 100)
+		testFirstLast(t, l, firstIndex, 100, nil)
 
 	})
-	t.Run("end-marker-file", func(t *testing.T) {
-		lpath := "testlog/end-marker"
-		opts := makeOpts(512, Medium, JSON)
-		l := must(Open(lpath, opts)).(*Log)
-		defer l.Close()
-		for i := uint64(1); i <= 100; i++ {
-			must(nil, l.Write(i, []byte(dataStr(i))))
-		}
-		path := l.segments[l.findSegment(35)].path
-		f := must(os.Open(path)).(*os.File)
-		defer f.Close()
-		rd := bufio.NewReader(f)
-		var lastIndex uint64
-		for {
-			n, _, err := readEntry(rd, JSON, true)
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			lastIndex = n
-		}
+	// t.Run("end-marker-file", func(t *testing.T) {
+	// 	lpath := "testlog/end-marker"
+	// 	opts := makeOpts(512, true, JSON)
+	// 	l := must(Open(lpath, opts)).(*Log)
+	// 	defer l.Close()
+	// 	for i := uint64(1); i <= 100; i++ {
+	// 		must(nil, l.Write(i, []byte(dataStr(i))))
+	// 	}
+	// 	path := l.segments[l.findSegment(35)].path
+	// 	data := must(ioutil.ReadFile(path)).([]byte)
+	// 	var lastIndex uint64
+	// 	for {
 
-		must(nil, l.Close())
-		data := must(ioutil.ReadFile(path)).([]byte)
-		must(nil, ioutil.WriteFile(path+".END", data, 0666))
-		l = must(Open(lpath, opts)).(*Log)
-		defer l.Close()
-		testFirstLast(t, l, 1, lastIndex)
-	})
+	// 		n, _, err := readEntry(rd, JSON, true)
+	// 		if err == io.EOF {
+	// 			break
+	// 		}
+	// 		if err != nil {
+	// 			t.Fatal(err)
+	// 		}
+	// 		lastIndex = n
+	// 	}
+
+	// 	must(nil, l.Close())
+	// 	data = must(ioutil.ReadFile(path)).([]byte)
+	// 	must(nil, ioutil.WriteFile(path+".END", data, 0666))
+	// 	l = must(Open(lpath, opts)).(*Log)
+	// 	defer l.Close()
+	// 	testFirstLast(t, l, 1, lastIndex)
+	// })
 
 }
 
-func makeOpts(segSize int, dur Durability, lf LogFormat) *Options {
+func makeOpts(segSize int, noSync bool, lf LogFormat) *Options {
 	opts := *DefaultOptions
 	opts.SegmentSize = segSize
-	opts.Durability = dur
+	opts.NoSync = noSync
 	opts.LogFormat = lf
 	return &opts
 }
@@ -637,4 +631,207 @@ func TestIssue1(t *testing.T) {
 	if string(in) != string(out) {
 		t.Fatal("data mismatch")
 	}
+}
+
+func TestSimpleTruncateFront(t *testing.T) {
+	os.RemoveAll("testlog")
+
+	opts := &Options{
+		NoSync:      true,
+		LogFormat:   JSON,
+		SegmentSize: 100,
+	}
+
+	l, err := Open("testlog", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		l.Close()
+	}()
+
+	makeData := func(index uint64) []byte {
+		return []byte(fmt.Sprintf("data-%d", index))
+	}
+
+	valid := func(t *testing.T, first, last uint64) {
+		t.Helper()
+		index, err := l.FirstIndex()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if index != first {
+			t.Fatalf("expected %v, got %v", first, index)
+		}
+		index, err = l.LastIndex()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if index != last {
+			t.Fatalf("expected %v, got %v", last, index)
+		}
+		for i := first; i <= last; i++ {
+			data, err := l.Read(i)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data) != string(makeData(i)) {
+				t.Fatalf("expcted '%s', got '%s'", makeData(i), data)
+			}
+		}
+	}
+	validReopen := func(t *testing.T, first, last uint64) {
+		t.Helper()
+		valid(t, first, last)
+		if err := l.Close(); err != nil {
+			t.Fatal(err)
+		}
+		l, err = Open("testlog", opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		valid(t, first, last)
+	}
+	for i := 1; i <= 100; i++ {
+		err := l.Write(uint64(i), makeData(uint64(i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	validReopen(t, 1, 100)
+
+	if err := l.TruncateFront(1); err != nil {
+		t.Fatal(err)
+	}
+	validReopen(t, 1, 100)
+
+	if err := l.TruncateFront(2); err != nil {
+		t.Fatal(err)
+	}
+	validReopen(t, 2, 100)
+
+	if err := l.TruncateFront(4); err != nil {
+		t.Fatal(err)
+	}
+	validReopen(t, 4, 100)
+
+	if err := l.TruncateFront(5); err != nil {
+		t.Fatal(err)
+	}
+	validReopen(t, 5, 100)
+
+	if err := l.TruncateFront(99); err != nil {
+		t.Fatal(err)
+	}
+	validReopen(t, 99, 100)
+
+	if err := l.TruncateFront(100); err != nil {
+		t.Fatal(err)
+	}
+	validReopen(t, 100, 100)
+
+}
+
+func TestSimpleTruncateBack(t *testing.T) {
+	os.RemoveAll("testlog")
+
+	opts := &Options{
+		NoSync:      true,
+		LogFormat:   JSON,
+		SegmentSize: 100,
+	}
+
+	l, err := Open("testlog", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		l.Close()
+	}()
+
+	makeData := func(index uint64) []byte {
+		return []byte(fmt.Sprintf("data-%d", index))
+	}
+
+	valid := func(t *testing.T, first, last uint64) {
+		t.Helper()
+		index, err := l.FirstIndex()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if index != first {
+			t.Fatalf("expected %v, got %v", first, index)
+		}
+		index, err = l.LastIndex()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if index != last {
+			t.Fatalf("expected %v, got %v", last, index)
+		}
+		for i := first; i <= last; i++ {
+			data, err := l.Read(i)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data) != string(makeData(i)) {
+				t.Fatalf("expcted '%s', got '%s'", makeData(i), data)
+			}
+		}
+	}
+	validReopen := func(t *testing.T, first, last uint64) {
+		t.Helper()
+		valid(t, first, last)
+		if err := l.Close(); err != nil {
+			t.Fatal(err)
+		}
+		l, err = Open("testlog", opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		valid(t, first, last)
+	}
+	for i := 1; i <= 100; i++ {
+		err := l.Write(uint64(i), makeData(uint64(i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	validReopen(t, 1, 100)
+
+	/////////////////////////////////////////////////////////////
+	if err := l.TruncateBack(100); err != nil {
+		t.Fatal(err)
+	}
+	validReopen(t, 1, 100)
+	if err := l.Write(101, makeData(101)); err != nil {
+		t.Fatal(err)
+	}
+	validReopen(t, 1, 101)
+
+	/////////////////////////////////////////////////////////////
+	if err := l.TruncateBack(99); err != nil {
+		t.Fatal(err)
+	}
+	validReopen(t, 1, 99)
+	if err := l.Write(100, makeData(100)); err != nil {
+		t.Fatal(err)
+	}
+	validReopen(t, 1, 100)
+
+	if err := l.TruncateBack(94); err != nil {
+		t.Fatal(err)
+	}
+	validReopen(t, 1, 94)
+
+	if err := l.TruncateBack(93); err != nil {
+		t.Fatal(err)
+	}
+	validReopen(t, 1, 93)
+
+	if err := l.TruncateBack(92); err != nil {
+		t.Fatal(err)
+	}
+	validReopen(t, 1, 92)
+
 }
