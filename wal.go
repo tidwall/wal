@@ -71,6 +71,11 @@ type Options struct {
 	// memory for caching. Increasing this value may enhance performance for
 	// concurrent read operations. Default is 1
 	SegmentCacheSize int
+	// NoCopy allows for the Read() operation to return the raw underlying data
+	// slice. This is an optimization to help minimize allocations. When this
+	// option is set, do not modify the returned data because it may affect
+	// other Read calls. Default false
+	NoCopy bool
 }
 
 // DefaultOptions for Open().
@@ -78,7 +83,8 @@ var DefaultOptions = &Options{
 	NoSync:           false,    // Fsync after every write
 	SegmentSize:      20971520, // 20 MB log segment files.
 	LogFormat:        Binary,   // Binary format is small and fast.
-	SegmentCacheSize: 1,        // Number of cached in-memory segments
+	SegmentCacheSize: 2,        // Number of cached in-memory segments
+	NoCopy:           false,    // Make a new copy of data for every Read call.
 }
 
 // Log represents a write ahead log
@@ -617,29 +623,40 @@ func (l *Log) Read(index uint64) (data []byte, err error) {
 	epos := s.epos[index-s.index]
 	edata := s.ebuf[epos.pos:epos.end]
 	if l.opts.LogFormat == JSON {
-		s := gjson.Get(*(*string)(unsafe.Pointer(&edata)), "data").String()
-		if len(s) > 0 && s[0] == '$' {
-			var err error
-			data, err = base64.URLEncoding.DecodeString(s[1:])
-			if err != nil {
-				return nil, ErrCorrupt
-			}
-		} else if len(s) > 0 && s[0] == '+' {
-			data = make([]byte, len(s[1:]))
-			copy(data, s[1:])
-		} else {
-			return nil, ErrCorrupt
-		}
+		return readJSON(edata)
+	}
+	// binary read
+	size, n := binary.Uvarint(edata)
+	if n <= 0 {
+		return nil, ErrCorrupt
+	}
+	if uint64(len(edata)-n) < size {
+		return nil, ErrCorrupt
+	}
+	if l.opts.NoCopy {
+		data = edata[n:size:size]
 	} else {
-		size, n := binary.Uvarint(edata)
-		if n <= 0 {
-			return nil, ErrCorrupt
-		}
-		if uint64(len(edata)-n) < size {
-			return nil, ErrCorrupt
-		}
 		data = make([]byte, size)
 		copy(data, edata[n:])
+	}
+	return data, nil
+}
+
+//go:noinline
+func readJSON(edata []byte) ([]byte, error) {
+	var data []byte
+	s := gjson.Get(*(*string)(unsafe.Pointer(&edata)), "data").String()
+	if len(s) > 0 && s[0] == '$' {
+		var err error
+		data, err = base64.URLEncoding.DecodeString(s[1:])
+		if err != nil {
+			return nil, ErrCorrupt
+		}
+	} else if len(s) > 0 && s[0] == '+' {
+		data = make([]byte, len(s[1:]))
+		copy(data, s[1:])
+	} else {
+		return nil, ErrCorrupt
 	}
 	return data, nil
 }
