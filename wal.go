@@ -634,7 +634,7 @@ func (l *Log) Read(index uint64) (data []byte, err error) {
 		return nil, ErrCorrupt
 	}
 	if l.opts.NoCopy {
-		data = edata[n:size:size]
+		data = edata[n : uint64(n)+size]
 	} else {
 		data = make([]byte, size)
 		copy(data, edata[n:])
