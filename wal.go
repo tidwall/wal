@@ -89,7 +89,7 @@ var DefaultOptions = &Options{
 
 // Log represents a write ahead log
 type Log struct {
-	mu         sync.Mutex
+	mu         sync.RWMutex
 	path       string      // absolute path to log directory
 	opts       Options     // log options
 	closed     bool        // log is closed
@@ -472,8 +472,8 @@ func (l *Log) writeBatch(b *Batch) error {
 // FirstIndex returns the index of the first entry in the log. Returns zero
 // when log has no entries.
 func (l *Log) FirstIndex() (index uint64, err error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	if l.corrupt {
 		return 0, ErrCorrupt
 	} else if l.closed {
@@ -490,8 +490,8 @@ func (l *Log) FirstIndex() (index uint64, err error) {
 // LastIndex returns the index of the last entry in the log. Returns zero when
 // log has no entries.
 func (l *Log) LastIndex() (index uint64, err error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	if l.corrupt {
 		return 0, ErrCorrupt
 	} else if l.closed {
@@ -606,8 +606,8 @@ func (l *Log) loadSegment(index uint64) (*segment, error) {
 
 // Read an entry from the log. Returns a byte slice containing the data entry.
 func (l *Log) Read(index uint64) (data []byte, err error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	if l.corrupt {
 		return nil, ErrCorrupt
 	} else if l.closed {

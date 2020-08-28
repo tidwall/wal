@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -834,4 +835,57 @@ func TestSimpleTruncateBack(t *testing.T) {
 	}
 	validReopen(t, 1, 92)
 
+}
+
+func TestConcurrency(t *testing.T) {
+	os.RemoveAll("testlog")
+
+	l, err := Open("testlog", &Options{
+		NoSync: true,
+		NoCopy: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	// Write 1000 entries
+	for i := 1; i <= 1000; i++ {
+		err := l.Write(uint64(i), []byte(dataStr(uint64(i))))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Perform 100,000 reads (over 100 threads)
+	finished := int32(0)
+	maxIndex := int32(1000)
+	numReads := int32(0)
+	for i := 0; i < 100; i++ {
+		go func() {
+			defer atomic.AddInt32(&finished, 1)
+
+			for i := 0; i < 1_000; i++ {
+				index := rand.Int31n(atomic.LoadInt32(&maxIndex)) + 1
+				if _, err := l.Read(uint64(index)); err != nil {
+					t.Fatal(err)
+				}
+				atomic.AddInt32(&numReads, 1)
+			}
+		}()
+	}
+
+	// continue writing
+	for index := maxIndex + 1; atomic.LoadInt32(&finished) < 100; index++ {
+		err := l.Write(uint64(index), []byte(dataStr(uint64(index))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		atomic.StoreInt32(&maxIndex, index)
+	}
+
+	// confirm total reads
+	if exp := int32(100_000); numReads != exp {
+		t.Fatalf("expected %d reads, but god %d", exp, numReads)
+	}
 }
