@@ -159,7 +159,7 @@ func (l *Log) pushCache(segIdx int) {
 	}
 }
 
-// load all the segments. This operation also cleansup any START/END segments.
+// load all the segments. This operation also cleans up any START/END segments.
 func (l *Log) load() error {
 	fis, err := ioutil.ReadDir(l.path)
 	if err != nil {
@@ -324,7 +324,7 @@ func (l *Log) cycle() error {
 	if err := l.sfile.Close(); err != nil {
 		return err
 	}
-	// cache the previous segement
+	// cache the previous segment
 	l.pushCache(len(l.segments) - 1)
 	s := &segment{
 		index: l.lastIndex + 1,
@@ -760,7 +760,7 @@ func (l *Log) truncateFront(index uint64) (err error) {
 	}
 	// Rename the START file to the final truncated segment name.
 	newName := filepath.Join(l.path, segmentName(index))
-	if os.Rename(startName, newName); err != nil {
+	if err = os.Rename(startName, newName); err != nil {
 		return err
 	}
 	s.path = newName
