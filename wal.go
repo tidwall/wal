@@ -76,6 +76,9 @@ type Options struct {
 	// option is set, do not modify the returned data because it may affect
 	// other Read calls. Default false
 	NoCopy bool
+	// Perms represents the datafiles modes and permission bits
+	DirPerms  os.FileMode
+	FilePerms os.FileMode
 }
 
 // DefaultOptions for Open().
@@ -85,6 +88,8 @@ var DefaultOptions = &Options{
 	LogFormat:        Binary,   // Binary format is small and fast.
 	SegmentCacheSize: 2,        // Number of cached in-memory segments
 	NoCopy:           false,    // Make a new copy of data for every Read call.
+	DirPerms:         0750,     // Permissions for the created directories
+	FilePerms:        0640,     // Permissions for the created data files
 }
 
 // Log represents a write ahead log
@@ -126,6 +131,13 @@ func Open(path string, opts *Options) (*Log, error) {
 	if opts.SegmentSize <= 0 {
 		opts.SegmentSize = DefaultOptions.SegmentSize
 	}
+	if opts.DirPerms == 0 {
+		opts.DirPerms = DefaultOptions.DirPerms
+	}
+	if opts.FilePerms == 0 {
+		opts.FilePerms = DefaultOptions.FilePerms
+	}
+
 	var err error
 	path, err = abs(path)
 	if err != nil {
@@ -133,7 +145,7 @@ func Open(path string, opts *Options) (*Log, error) {
 	}
 	l := &Log{path: path, opts: *opts}
 	l.scache.Resize(l.opts.SegmentCacheSize)
-	if err := os.MkdirAll(path, 0777); err != nil {
+	if err := os.MkdirAll(path, l.opts.DirPerms); err != nil {
 		return nil, err
 	}
 	if err := l.load(); err != nil {
@@ -199,6 +211,9 @@ func (l *Log) load() error {
 		l.firstIndex = 1
 		l.lastIndex = 0
 		l.sfile, err = os.Create(l.segments[0].path)
+		if err == nil {
+			l.sfile.Chmod(l.opts.FilePerms)
+		}
 		return err
 	}
 	// Open existing log. Clean up log if START of END segments exists.
@@ -250,7 +265,7 @@ func (l *Log) load() error {
 	l.firstIndex = l.segments[0].index
 	// Open the last segment for appending
 	lseg := l.segments[len(l.segments)-1]
-	l.sfile, err = os.OpenFile(lseg.path, os.O_WRONLY, 0666)
+	l.sfile, err = os.OpenFile(lseg.path, os.O_WRONLY, l.opts.FilePerms)
 	if err != nil {
 		return err
 	}
@@ -335,6 +350,7 @@ func (l *Log) cycle() error {
 	if err != nil {
 		return err
 	}
+	l.sfile.Chmod(l.opts.FilePerms)
 	l.segments = append(l.segments, s)
 	return nil
 }
@@ -721,6 +737,7 @@ func (l *Log) truncateFront(index uint64) (err error) {
 		if err != nil {
 			return err
 		}
+		f.Chmod(l.opts.FilePerms)
 		defer f.Close()
 		if _, err := f.Write(ebuf); err != nil {
 			return err
@@ -767,7 +784,7 @@ func (l *Log) truncateFront(index uint64) (err error) {
 	s.index = index
 	if segIdx == len(l.segments)-1 {
 		// Reopen the tail segment file
-		if l.sfile, err = os.OpenFile(newName, os.O_WRONLY, 0666); err != nil {
+		if l.sfile, err = os.OpenFile(newName, os.O_WRONLY, l.opts.FilePerms); err != nil {
 			return err
 		}
 		var n int64
@@ -827,6 +844,7 @@ func (l *Log) truncateBack(index uint64) (err error) {
 		if err != nil {
 			return err
 		}
+		f.Chmod(l.opts.FilePerms)
 		defer f.Close()
 		if _, err := f.Write(ebuf); err != nil {
 			return err
@@ -869,7 +887,7 @@ func (l *Log) truncateBack(index uint64) (err error) {
 		return err
 	}
 	// Reopen the tail segment file
-	if l.sfile, err = os.OpenFile(newName, os.O_WRONLY, 0666); err != nil {
+	if l.sfile, err = os.OpenFile(newName, os.O_WRONLY, l.opts.FilePerms); err != nil {
 		return err
 	}
 	var n int64
