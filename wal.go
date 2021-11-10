@@ -915,10 +915,3 @@ func (l *Log) Sync() error {
 	}
 	return l.sfile.Sync()
 }
-
-func must(v interface{}, err error) interface{} {
-	if err != nil {
-		panic(err)
-	}
-	return v
-}
