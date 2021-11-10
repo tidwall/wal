@@ -889,3 +889,10 @@ func TestConcurrency(t *testing.T) {
 		t.Fatalf("expected %d reads, but god %d", exp, numReads)
 	}
 }
+
+func must(v interface{}, err error) interface{} {
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
