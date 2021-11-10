@@ -210,10 +210,7 @@ func (l *Log) load() error {
 		})
 		l.firstIndex = 1
 		l.lastIndex = 0
-		l.sfile, err = os.Create(l.segments[0].path)
-		if err == nil {
-			l.sfile.Chmod(l.opts.FilePerms)
-		}
+		l.sfile, err = os.OpenFile(l.segments[0].path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, l.opts.FilePerms)
 		return err
 	}
 	// Open existing log. Clean up log if START of END segments exists.
@@ -346,11 +343,10 @@ func (l *Log) cycle() error {
 		path:  filepath.Join(l.path, segmentName(l.lastIndex+1)),
 	}
 	var err error
-	l.sfile, err = os.Create(s.path)
+	l.sfile, err = os.OpenFile(s.path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, l.opts.FilePerms)
 	if err != nil {
 		return err
 	}
-	l.sfile.Chmod(l.opts.FilePerms)
 	l.segments = append(l.segments, s)
 	return nil
 }
@@ -733,11 +729,10 @@ func (l *Log) truncateFront(index uint64) (err error) {
 	// Create a temp file contains the truncated segment.
 	tempName := filepath.Join(l.path, "TEMP")
 	err = func() error {
-		f, err := os.Create(tempName)
+		f, err := os.OpenFile(tempName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, l.opts.FilePerms)
 		if err != nil {
 			return err
 		}
-		f.Chmod(l.opts.FilePerms)
 		defer f.Close()
 		if _, err := f.Write(ebuf); err != nil {
 			return err
@@ -840,11 +835,10 @@ func (l *Log) truncateBack(index uint64) (err error) {
 	// Create a temp file contains the truncated segment.
 	tempName := filepath.Join(l.path, "TEMP")
 	err = func() error {
-		f, err := os.Create(tempName)
+		f, err := os.OpenFile(tempName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, l.opts.FilePerms)
 		if err != nil {
 			return err
 		}
-		f.Chmod(l.opts.FilePerms)
 		defer f.Close()
 		if _, err := f.Write(ebuf); err != nil {
 			return err
