@@ -354,13 +354,13 @@ func (l *Log) cycle() error {
 func appendJSONEntry(dst []byte, index uint64, data []byte) (out []byte,
 	epos bpos) {
 	// {"index":number,"data":string}
-	mark := len(dst)
+	pos := len(dst)
 	dst = append(dst, `{"index":"`...)
 	dst = strconv.AppendUint(dst, index, 10)
 	dst = append(dst, `","data":`...)
 	dst = appendJSONData(dst, data)
 	dst = append(dst, '}', '\n')
-	return dst, bpos{mark, len(dst)}
+	return dst, bpos{pos, len(dst)}
 }
 
 func appendJSONData(dst []byte, s []byte) []byte {
