@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -173,7 +172,7 @@ func (l *Log) pushCache(segIdx int) {
 
 // load all the segments. This operation also cleans up any START/END segments.
 func (l *Log) load() error {
-	fis, err := ioutil.ReadDir(l.path)
+	fis, err := os.ReadDir(l.path)
 	if err != nil {
 		return err
 	}
@@ -530,14 +529,14 @@ func (l *Log) findSegment(index uint64) int {
 }
 
 func (l *Log) loadSegmentEntries(s *segment) error {
-	data, err := ioutil.ReadFile(s.path)
+	data, err := os.ReadFile(s.path)
 	if err != nil {
 		return err
 	}
 	ebuf := data
 	var epos []bpos
 	var pos int
-	for exidx := s.index; len(data) > 0; exidx++ {
+	for len(data) > 0 {
 		var n int
 		if l.opts.LogFormat == JSON {
 			n, err = loadNextJSONEntry(data)
@@ -742,6 +741,9 @@ func (l *Log) truncateFront(index uint64) (err error) {
 		}
 		return f.Close()
 	}()
+	if err != nil {
+		return err
+	}
 	// Rename the TEMP file to it's START file name.
 	startName := filepath.Join(l.path, segmentName(index)+".START")
 	if err = os.Rename(tempName, startName); err != nil {
@@ -848,6 +850,9 @@ func (l *Log) truncateBack(index uint64) (err error) {
 		}
 		return f.Close()
 	}()
+	if err != nil {
+		return err
+	}
 	// Rename the TEMP file to it's END file name.
 	endName := filepath.Join(l.path, segmentName(s.index)+".END")
 	if err = os.Rename(tempName, endName); err != nil {
