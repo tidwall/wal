@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/ncw/directio"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/tinylru"
 )
@@ -109,10 +111,10 @@ type Log struct {
 
 // segment represents a single segment file.
 type segment struct {
-	path  string // path of segment file
-	index uint64 // first index of segment
-	ebuf  []byte // cached entries buffer
-	epos  []bpos // cached entries positions in buffer
+	path  string
+	ebuf  []byte
+	epos  []bpos
+	index uint64
 }
 
 type bpos struct {
@@ -210,7 +212,7 @@ func (l *Log) load() error {
 		})
 		l.firstIndex = 1
 		l.lastIndex = 0
-		l.sfile, err = os.OpenFile(l.segments[0].path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, l.opts.FilePerms)
+		l.sfile, err = directio.OpenFile(l.segments[0].path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, l.opts.FilePerms)
 		return err
 	}
 	// Open existing log. Clean up log if START of END segments exists.
@@ -262,7 +264,7 @@ func (l *Log) load() error {
 	l.firstIndex = l.segments[0].index
 	// Open the last segment for appending
 	lseg := l.segments[len(l.segments)-1]
-	l.sfile, err = os.OpenFile(lseg.path, os.O_WRONLY, l.opts.FilePerms)
+	l.sfile, err = directio.OpenFile(lseg.path, os.O_WRONLY, l.opts.FilePerms)
 	if err != nil {
 		return err
 	}
@@ -343,7 +345,7 @@ func (l *Log) cycle() error {
 		path:  filepath.Join(l.path, segmentName(l.lastIndex+1)),
 	}
 	var err error
-	l.sfile, err = os.OpenFile(s.path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, l.opts.FilePerms)
+	l.sfile, err = directio.OpenFile(s.path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, l.opts.FilePerms)
 	if err != nil {
 		return err
 	}
@@ -454,7 +456,7 @@ func (l *Log) writeBatch(b *Batch) error {
 		s.epos = append(s.epos, epos)
 		if len(s.ebuf) >= l.opts.SegmentSize {
 			// segment has reached capacity, cycle now
-			if _, err := l.sfile.Write(s.ebuf[mark:]); err != nil {
+			if err := Write(l.sfile, s.ebuf[mark:]); err != nil {
 				return err
 			}
 			l.lastIndex = b.entries[i].index
@@ -467,7 +469,7 @@ func (l *Log) writeBatch(b *Batch) error {
 		datas = datas[b.entries[i].size:]
 	}
 	if len(s.ebuf)-mark > 0 {
-		if _, err := l.sfile.Write(s.ebuf[mark:]); err != nil {
+		if err := Write(l.sfile, s.ebuf[mark:]); err != nil {
 			return err
 		}
 		l.lastIndex = b.entries[len(b.entries)-1].index
@@ -530,7 +532,7 @@ func (l *Log) findSegment(index uint64) int {
 }
 
 func (l *Log) loadSegmentEntries(s *segment) error {
-	data, err := ioutil.ReadFile(s.path)
+	data, err := ReadFile(s.path)
 	if err != nil {
 		return err
 	}
@@ -729,12 +731,12 @@ func (l *Log) truncateFront(index uint64) (err error) {
 	// Create a temp file contains the truncated segment.
 	tempName := filepath.Join(l.path, "TEMP")
 	err = func() error {
-		f, err := os.OpenFile(tempName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, l.opts.FilePerms)
+		f, err := directio.OpenFile(tempName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, l.opts.FilePerms)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
-		if _, err := f.Write(ebuf); err != nil {
+		if err := Write(f, ebuf); err != nil {
 			return err
 		}
 		if err := f.Sync(); err != nil {
@@ -779,7 +781,7 @@ func (l *Log) truncateFront(index uint64) (err error) {
 	s.index = index
 	if segIdx == len(l.segments)-1 {
 		// Reopen the tail segment file
-		if l.sfile, err = os.OpenFile(newName, os.O_WRONLY, l.opts.FilePerms); err != nil {
+		if l.sfile, err = directio.OpenFile(newName, os.O_WRONLY, l.opts.FilePerms); err != nil {
 			return err
 		}
 		var n int64
@@ -835,12 +837,12 @@ func (l *Log) truncateBack(index uint64) (err error) {
 	// Create a temp file contains the truncated segment.
 	tempName := filepath.Join(l.path, "TEMP")
 	err = func() error {
-		f, err := os.OpenFile(tempName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, l.opts.FilePerms)
+		f, err := directio.OpenFile(tempName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, l.opts.FilePerms)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
-		if _, err := f.Write(ebuf); err != nil {
+		if err := Write(f, ebuf); err != nil {
 			return err
 		}
 		if err := f.Sync(); err != nil {
@@ -881,7 +883,7 @@ func (l *Log) truncateBack(index uint64) (err error) {
 		return err
 	}
 	// Reopen the tail segment file
-	if l.sfile, err = os.OpenFile(newName, os.O_WRONLY, l.opts.FilePerms); err != nil {
+	if l.sfile, err = directio.OpenFile(newName, os.O_WRONLY, l.opts.FilePerms); err != nil {
 		return err
 	}
 	var n int64
@@ -914,4 +916,62 @@ func (l *Log) Sync() error {
 		return ErrClosed
 	}
 	return l.sfile.Sync()
+}
+
+// ReadFile reads the named file and returns the contents.
+// A successful call returns err == nil, not err == EOF.
+// Because ReadFile reads the whole file, it does not treat an EOF from Read
+// as an error to be reported.
+func ReadFile(name string) ([]byte, error) {
+	f, err := directio.OpenFile(name, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var size int
+	if info, err := f.Stat(); err == nil {
+		size64 := info.Size()
+		if int64(int(size64)) == size64 {
+			size = int(size64)
+		}
+	}
+	size++ // one byte for final read at EOF
+
+	// If a file claims a small size, read at least 512 bytes.
+	// In particular, files in Linux's /proc claim size 0 but
+	// then do not work right if read in small pieces,
+	// so an initial read of 1 byte would not work correctly.
+	if size < 512 {
+		size = 512
+	}
+
+	block := directio.AlignedBlock(directio.BlockSize)
+	data := make([]byte, 0, size)
+	for {
+		n, err := f.Read(block[:cap(block)])
+		data = append(data, block[:n]...)
+		if err != nil {
+			if err == io.EOF {
+				err = nil
+			}
+			return data, err
+		}
+	}
+}
+
+func Write(file *os.File, data []byte) error {
+	block := directio.AlignedBlock(directio.BlockSize)
+	offset := 0
+	for {
+		len := copy(block, data[offset:])
+		if len == 0 {
+			return nil
+		}
+		_, err := file.Write(block[:len])
+		if err != nil {
+			return err
+		}
+		offset += len
+	}
 }
