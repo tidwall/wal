@@ -1,4 +1,4 @@
-module github.com/aldelucca/wal
+module github.com/aldelucca1/wal
 
 go 1.13
 
