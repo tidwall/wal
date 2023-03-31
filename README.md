@@ -27,7 +27,7 @@ This will retrieve the library.
 
 ```go
 // open a new log file
-log, err := Open("mylog", nil)
+log, err := wal.Open("mylog", nil)
 
 // write some entries
 err = log.Write(1, []byte("first entry"))
@@ -47,7 +47,7 @@ Batch writes:
 ```go
 
 // write three entries as a batch
-batch := new(Batch)
+batch := new(wal.Batch)
 batch.Write(1, []byte("first entry"))
 batch.Write(2, []byte("second entry"))
 batch.Write(3, []byte("third entry"))
