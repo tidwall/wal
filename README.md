@@ -64,8 +64,8 @@ err = log.Write(1, []byte("first entry"))
 err = log.Write(1000, []byte("thousandth entry"))
 
 // truncate the log from index starting 350 and ending with 950.
-err = l.TruncateFront(350)
-err = l.TruncateBack(950)
+err = log.TruncateFront(350)
+err = log.TruncateBack(950)
 ```
 
 
