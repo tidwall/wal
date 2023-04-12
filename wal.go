@@ -308,6 +308,7 @@ func (l *Log) Close() error {
 
 // Write an entry to the log.
 func (l *Log) Write(index uint64, data []byte) error {
+	fmt.Println("write", index)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.corrupt {
@@ -429,9 +430,18 @@ func (l *Log) WriteBatch(b *Batch) error {
 }
 
 func (l *Log) writeBatch(b *Batch) error {
+	if b.entries[0].index == 0 {
+		return ErrOutOfOrder
+	}
 	// check that all indexes in batch are sane
+	lastIndex := l.lastIndex
+	if lastIndex == 0 {
+		// allow start from arbitrary start index if WAL is empty
+		lastIndex = b.entries[0].index - 1
+	}
 	for i := 0; i < len(b.entries); i++ {
-		if b.entries[i].index != l.lastIndex+uint64(i+1) {
+		if b.entries[i].index != lastIndex+uint64(i+1) {
+			fmt.Println("out of order", b.entries[i].index, lastIndex, i)
 			return ErrOutOfOrder
 		}
 	}
@@ -443,6 +453,12 @@ func (l *Log) writeBatch(b *Batch) error {
 			return err
 		}
 		s = l.segments[len(l.segments)-1]
+	}
+
+	if l.lastIndex == 0 {
+		// initialize the start index with the first entry
+		s.index = b.entries[0].index
+		l.firstIndex = b.entries[0].index
 	}
 
 	mark := len(s.ebuf)
