@@ -519,6 +519,8 @@ func TestOutliers(t *testing.T) {
 	t.Run("fail-corrupted-tail-json", func(t *testing.T) {
 		defer os.RemoveAll("testlog/corrupt-tail")
 		opts := makeOpts(512, true, JSON)
+		optsRecoverTail := *opts
+		optsRecoverTail.RecoverCorruptedTail = true
 		os.MkdirAll("testlog/corrupt-tail", 0777)
 		ioutil.WriteFile(
 			"testlog/corrupt-tail/00000000000000000001",
@@ -527,12 +529,20 @@ func TestOutliers(t *testing.T) {
 			l.Close()
 			t.Fatalf("expected %v, got %v", ErrCorrupt, err)
 		}
+		if l, err := Open("testlog/corrupt-tail", &optsRecoverTail); err != nil {
+			l.Close()
+			t.Fatalf("expected %v, got %v", nil, err)
+		}
 		ioutil.WriteFile(
 			"testlog/corrupt-tail/00000000000000000001",
 			[]byte(`{}`+"\n"), 0666)
 		if l, err := Open("testlog/corrupt-tail", opts); err != ErrCorrupt {
 			l.Close()
 			t.Fatalf("expected %v, got %v", ErrCorrupt, err)
+		}
+		if l, err := Open("testlog/corrupt-tail", &optsRecoverTail); err != nil {
+			l.Close()
+			t.Fatalf("expected %v, got %v", nil, err)
 		}
 		ioutil.WriteFile(
 			"testlog/corrupt-tail/00000000000000000001",
@@ -541,12 +551,20 @@ func TestOutliers(t *testing.T) {
 			l.Close()
 			t.Fatalf("expected %v, got %v", ErrCorrupt, err)
 		}
+		if l, err := Open("testlog/corrupt-tail", &optsRecoverTail); err != nil {
+			l.Close()
+			t.Fatalf("expected %v, got %v", nil, err)
+		}
 		ioutil.WriteFile(
 			"testlog/corrupt-tail/00000000000000000001",
 			[]byte(`{"index":"1","data":"?"}`), 0666)
 		if l, err := Open("testlog/corrupt-tail", opts); err != ErrCorrupt {
 			l.Close()
 			t.Fatalf("expected %v, got %v", ErrCorrupt, err)
+		}
+		if l, err := Open("testlog/corrupt-tail", &optsRecoverTail); err != nil {
+			l.Close()
+			t.Fatalf("expected %v, got %v", nil, err)
 		}
 	})
 
