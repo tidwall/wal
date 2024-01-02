@@ -635,7 +635,7 @@ func (l *Log) Read(index uint64) (data []byte, err error) {
 	epos := s.epos[index-s.index]
 	edata := s.ebuf[epos.pos:epos.end]
 	if l.opts.LogFormat == JSON {
-		return readJSON(edata)
+		return readJSON(edata, l.opts.NoCopy)
 	}
 	// binary read
 	size, n := binary.Uvarint(edata)
@@ -655,7 +655,7 @@ func (l *Log) Read(index uint64) (data []byte, err error) {
 }
 
 //go:noinline
-func readJSON(edata []byte) ([]byte, error) {
+func readJSON(edata []byte, noCopy bool) ([]byte, error) {
 	var data []byte
 	s := gjson.Get(*(*string)(unsafe.Pointer(&edata)), "data").String()
 	if len(s) > 0 && s[0] == '$' {
@@ -665,8 +665,13 @@ func readJSON(edata []byte) ([]byte, error) {
 			return nil, ErrCorrupt
 		}
 	} else if len(s) > 0 && s[0] == '+' {
-		data = make([]byte, len(s[1:]))
-		copy(data, s[1:])
+		d := s[1:]
+		if noCopy {
+			data = *(*[]byte)(unsafe.Pointer(&d))
+		} else {
+			data = make([]byte, len(d))
+			copy(data, d)
+		}
 	} else {
 		return nil, ErrCorrupt
 	}
