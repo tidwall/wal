@@ -915,3 +915,18 @@ func (l *Log) Sync() error {
 	}
 	return l.sfile.Sync()
 }
+
+// Clear empties the log, removing all entries and resetting
+// the index back to its default value
+func (l *Log) Clear() error {
+	for _, segment := range l.segments {
+		if err := os.Remove(segment.path); err != nil {
+			return err
+		}
+	}
+	l.sfile = nil
+	l.firstIndex = 0
+	l.lastIndex = 0
+	l.clearCache()
+	return nil
+}
