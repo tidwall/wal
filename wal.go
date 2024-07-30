@@ -919,14 +919,23 @@ func (l *Log) Sync() error {
 // Clear empties the log, removing all entries and resetting
 // the index back to its default value
 func (l *Log) Clear() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Clean up segment files
 	for _, segment := range l.segments {
 		if err := os.Remove(segment.path); err != nil {
 			return err
 		}
 	}
+
+	// Clear most state
+	l.segments = []*segment{}
 	l.sfile = nil
-	l.firstIndex = 0
+	l.firstIndex = 1
 	l.lastIndex = 0
 	l.clearCache()
-	return nil
+
+	// Load the log as if it were new again
+	return l.load()
 }
