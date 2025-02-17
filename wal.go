@@ -699,6 +699,7 @@ func (l *Log) clearCache() {
 // TruncateFront truncates the front of the log by removing all entries that
 // are before the provided `index`. In other words the entry at
 // `index` becomes the first entry in the log.
+// If `index` equals to `LastIndex()+1`, all entries will be truncated.
 func (l *Log) TruncateFront(index uint64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -711,21 +712,30 @@ func (l *Log) TruncateFront(index uint64) error {
 }
 func (l *Log) truncateFront(index uint64) (err error) {
 	if index == 0 || l.lastIndex == 0 ||
-		index < l.firstIndex || index > l.lastIndex {
+		index < l.firstIndex || index > l.lastIndex+1 {
 		return ErrOutOfRange
 	}
 	if index == l.firstIndex {
 		// nothing to truncate
 		return nil
 	}
-	segIdx := l.findSegment(index)
+	var segIdx int
 	var s *segment
-	s, err = l.loadSegment(index)
-	if err != nil {
-		return err
+	var ebuf []byte
+	if index == l.lastIndex+1 {
+		// Truncate all entries, only care about the last segment
+		segIdx = len(l.segments) - 1
+		s = l.segments[segIdx]
+		ebuf = nil
+	} else {
+		segIdx = l.findSegment(index)
+		s, err = l.loadSegment(index)
+		if err != nil {
+			return err
+		}
+		epos := s.epos[index-s.index:]
+		ebuf = s.ebuf[epos[0].pos:]
 	}
-	epos := s.epos[index-s.index:]
-	ebuf := s.ebuf[epos[0].pos:]
 	// Create a temp file contains the truncated segment.
 	tempName := filepath.Join(l.path, "TEMP")
 	if err = func() error {
@@ -806,6 +816,7 @@ func (l *Log) truncateFront(index uint64) (err error) {
 // TruncateBack truncates the back of the log by removing all entries that
 // are after the provided `index`. In other words the entry at `index`
 // becomes the last entry in the log.
+// If `index` equals to `FirstIndex()-1`, all entries will be truncated.
 func (l *Log) TruncateBack(index uint64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -818,22 +829,32 @@ func (l *Log) TruncateBack(index uint64) error {
 }
 
 func (l *Log) truncateBack(index uint64) (err error) {
-	if index == 0 || l.lastIndex == 0 ||
-		index < l.firstIndex || index > l.lastIndex {
+	// Allow index == 0 to truncate all entries when l.firstIndex == 1
+	if l.lastIndex == 0 ||
+		index < l.firstIndex-1 || index > l.lastIndex {
 		return ErrOutOfRange
 	}
 	if index == l.lastIndex {
 		// nothing to truncate
 		return nil
 	}
-	segIdx := l.findSegment(index)
+	var segIdx int
 	var s *segment
-	s, err = l.loadSegment(index)
-	if err != nil {
-		return err
+	var ebuf []byte
+	if index == l.firstIndex-1 {
+		// Truncate all entries, only care about the first segment
+		segIdx = 0
+		s = l.segments[segIdx]
+		ebuf = nil
+	} else {
+		segIdx = l.findSegment(index)
+		s, err = l.loadSegment(index)
+		if err != nil {
+			return err
+		}
+		epos := s.epos[:index-s.index+1]
+		ebuf = s.ebuf[:epos[len(epos)-1].end]
 	}
-	epos := s.epos[:index-s.index+1]
-	ebuf := s.ebuf[:epos[len(epos)-1].end]
 	// Create a temp file contains the truncated segment.
 	tempName := filepath.Join(l.path, "TEMP")
 	if err = func() error {
