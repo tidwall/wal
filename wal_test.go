@@ -1,11 +1,13 @@
 package wal
 
 import (
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -25,13 +27,21 @@ func testLog(t *testing.T, opts *Options, N int) {
 	}
 	defer l.Close()
 
+	var rangeCases []int
+
 	// FirstIndex - should be zero
 	n, err := l.FirstIndex()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 0 {
-		t.Fatalf("expected %d, got %d", 0, n)
+	if l.opts.AllowEmpty {
+		if n != 1 {
+			t.Fatalf("expected %d, got %d", 1, n)
+		}
+	} else {
+		if n != 0 {
+			t.Fatalf("expected %d, got %d", 0, n)
+		}
 	}
 
 	// LastIndex - should be zero
@@ -287,7 +297,12 @@ func testLog(t *testing.T, opts *Options, N int) {
 	}
 
 	// TruncateFront -- should fail, out of range
-	for _, i := range []int{0, N + 1} {
+	if l.opts.AllowEmpty {
+		rangeCases = []int{0, N + 2}
+	} else {
+		rangeCases = []int{0, N + 1}
+	}
+	for _, i := range rangeCases {
 		index := uint64(i)
 		if err = l.TruncateFront(index); err != ErrOutOfRange {
 			t.Fatalf("expected %v, got %v", ErrOutOfRange, err)
@@ -332,7 +347,12 @@ func testLog(t *testing.T, opts *Options, N int) {
 	}
 
 	// TruncateBack -- should fail, out of range
-	for _, i := range []int{0, 80} {
+	if l.opts.AllowEmpty {
+		rangeCases = []int{0, 79}
+	} else {
+		rangeCases = []int{0, 80}
+	}
+	for _, i := range rangeCases {
 		index := uint64(i)
 		if err = l.TruncateBack(index); err != ErrOutOfRange {
 			t.Fatalf("expected %v, got %v", ErrOutOfRange, err)
@@ -416,6 +436,27 @@ func testLog(t *testing.T, opts *Options, N int) {
 
 	l.Sync()
 	testFirstLast(t, l, uint64(N-1), uint64(N), nil)
+
+	if l.opts.AllowEmpty {
+		// TruncateFront -- truncate all entries
+		if err = l.TruncateFront(uint64(N + 1)); err != nil {
+			t.Fatal(err)
+		}
+		testFirstLast(t, l, uint64(N+1), uint64(N), nil)
+
+		err = l.Write(uint64(N+1), []byte(dataStr(uint64(N+1))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		N++
+		testFirstLast(t, l, uint64(N), uint64(N), nil)
+
+		// TruncateBack -- truncate all entries
+		if err = l.TruncateBack(uint64(N - 1)); err != nil {
+			t.Fatal(err)
+		}
+		testFirstLast(t, l, uint64(N), uint64(N-1), nil)
+	}
 }
 
 func testFirstLast(t *testing.T, l *Log, expectFirst, expectLast uint64, data func(index uint64) []byte) {
@@ -453,20 +494,28 @@ func TestLog(t *testing.T) {
 	t.Run("nil-opts", func(t *testing.T) {
 		testLog(t, nil, 100)
 	})
+	t.Run("allow-empty", func(t *testing.T) {
+		testLog(t, makeOpts(
+			DefaultOptions.SegmentSize,
+			DefaultOptions.NoSync,
+			DefaultOptions.LogFormat,
+			true,
+		), 100)
+	})
 	t.Run("no-sync", func(t *testing.T) {
 		t.Run("json", func(t *testing.T) {
-			testLog(t, makeOpts(512, true, JSON), 100)
+			testLog(t, makeOpts(512, true, JSON, false), 100)
 		})
 		t.Run("binary", func(t *testing.T) {
-			testLog(t, makeOpts(512, true, Binary), 100)
+			testLog(t, makeOpts(512, true, Binary, false), 100)
 		})
 	})
 	t.Run("sync", func(t *testing.T) {
 		t.Run("json", func(t *testing.T) {
-			testLog(t, makeOpts(512, false, JSON), 100)
+			testLog(t, makeOpts(512, false, JSON, false), 100)
 		})
 		t.Run("binary", func(t *testing.T) {
-			testLog(t, makeOpts(512, false, Binary), 100)
+			testLog(t, makeOpts(512, false, Binary, false), 100)
 		})
 	})
 }
@@ -518,7 +567,7 @@ func TestOutliers(t *testing.T) {
 
 	t.Run("fail-corrupted-tail-json", func(t *testing.T) {
 		defer os.RemoveAll("testlog/corrupt-tail")
-		opts := makeOpts(512, true, JSON)
+		opts := makeOpts(512, true, JSON, false)
 		os.MkdirAll("testlog/corrupt-tail", 0777)
 		ioutil.WriteFile(
 			"testlog/corrupt-tail/00000000000000000001",
@@ -552,7 +601,7 @@ func TestOutliers(t *testing.T) {
 
 	t.Run("start-marker-file", func(t *testing.T) {
 		lpath := "testlog/start-marker"
-		opts := makeOpts(512, true, JSON)
+		opts := makeOpts(512, true, JSON, false)
 		l := must(Open(lpath, opts)).(*Log)
 		defer l.Close()
 		for i := uint64(1); i <= 100; i++ {
@@ -601,11 +650,12 @@ func TestOutliers(t *testing.T) {
 
 }
 
-func makeOpts(segSize int, noSync bool, lf LogFormat) *Options {
+func makeOpts(segSize int, noSync bool, lf LogFormat, allowEmpty bool) *Options {
 	opts := *DefaultOptions
 	opts.SegmentSize = segSize
 	opts.NoSync = noSync
 	opts.LogFormat = lf
+	opts.AllowEmpty = allowEmpty
 	return &opts
 }
 
@@ -888,6 +938,73 @@ func TestConcurrency(t *testing.T) {
 	if exp := int32(100_000); numReads != exp {
 		t.Fatalf("expected %d reads, but god %d", exp, numReads)
 	}
+}
+
+func TestRWConcurrency(t *testing.T) {
+	os.RemoveAll("testlog")
+
+	l, err := Open("testlog", &Options{
+		NoSync:     true,
+		NoCopy:     true,
+		AllowEmpty: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+	notify := make(chan struct{}, 1)
+	count := 100
+
+	go func() {
+		defer wg.Done()
+		defer close(notify)
+		idx, _ := l.LastIndex()
+		for i := 0; i < count; i++ {
+			idx++
+			if err := l.Write(idx, []byte(dataStr(uint64(i)))); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case notify <- struct{}{}:
+			default:
+			}
+		}
+		if idx != uint64(count) {
+			t.Fatalf("expected last index %d, got %d", count, idx)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		idx, _ := l.FirstIndex()
+		for {
+			var ok bool
+			select {
+			case _, ok = <-notify:
+			}
+			for {
+				_, err := l.Read(idx)
+				if errors.Is(err, ErrNotFound) {
+					break
+				}
+				if err := l.TruncateFront(idx + 1); err != nil {
+					t.Fatal(err)
+				}
+				idx++
+			}
+			if !ok {
+				break
+			}
+		}
+		if idx != uint64(count+1) {
+			t.Fatalf("expected first index %d, got %d", count+1, idx)
+		}
+	}()
+
+	wg.Wait()
 }
 
 func must(v interface{}, err error) interface{} {
