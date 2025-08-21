@@ -79,9 +79,6 @@ type Options struct {
 	// Perms represents the datafiles modes and permission bits
 	DirPerms  os.FileMode
 	FilePerms os.FileMode
-	// AllowEmpty allows truncating the log to an empty state. This is useful
-	// when the log is used as an online persistent message queue.
-	AllowEmpty bool
 }
 
 // DefaultOptions for Open().
@@ -93,7 +90,6 @@ var DefaultOptions = &Options{
 	NoCopy:           false,    // Make a new copy of data for every Read call.
 	DirPerms:         0750,     // Permissions for the created directories
 	FilePerms:        0640,     // Permissions for the created data files
-	AllowEmpty:       false,    // Disallow empty log truncation for backwards compatibility
 }
 
 // Log represents a write ahead log
@@ -485,8 +481,8 @@ func (l *Log) writeBatch(b *Batch) error {
 	return nil
 }
 
-// FirstIndex returns the index of the first entry in the log.
-// If AllowEmpty is set to false, returns zero when log has no entries.
+// FirstIndex returns the index of the next entry to read in the log.
+// It points to the next future index if the log is currently empty.
 func (l *Log) FirstIndex() (index uint64, err error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -495,16 +491,17 @@ func (l *Log) FirstIndex() (index uint64, err error) {
 	} else if l.closed {
 		return 0, ErrClosed
 	}
-	// We check the lastIndex for zero because the firstIndex is always one or
-	// more, even when there's no entries
-	if !l.opts.AllowEmpty && l.lastIndex == 0 {
-		return 0, nil
-	}
+	// No longer check the lastIndex for zero because we allow empty logs since
+	// #31 was merged.
+	// https://github.com/tidwall/wal/pull/31
+	//if l.lastIndex == 0 {
+	//	return 0, nil
+	//}
 	return l.firstIndex, nil
 }
 
-// LastIndex returns the index of the last entry in the log.
-// If AllowEmpty is set to false, returns zero when log has no entries.
+// LastIndex returns the index of the last entry has been written to the log.
+// It points to the last deleted index if the log is currently empty.
 func (l *Log) LastIndex() (index uint64, err error) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -513,9 +510,12 @@ func (l *Log) LastIndex() (index uint64, err error) {
 	} else if l.closed {
 		return 0, ErrClosed
 	}
-	if !l.opts.AllowEmpty && l.lastIndex == 0 {
-		return 0, nil
-	}
+	// No longer check the lastIndex for zero because we allow empty logs since
+	// #31 was merged.
+	// https://github.com/tidwall/wal/pull/31
+	//if l.lastIndex == 0 {
+	//	return 0, nil
+	//}
 	return l.lastIndex, nil
 }
 
@@ -714,10 +714,9 @@ func (l *Log) TruncateFront(index uint64) error {
 	}
 	return l.truncateFront(index)
 }
+
 func (l *Log) truncateFront(index uint64) (err error) {
-	if index == 0 || l.lastIndex == 0 ||
-		index < l.firstIndex || index > l.lastIndex+1 ||
-		(!l.opts.AllowEmpty && index > l.lastIndex) {
+	if index < l.firstIndex || index > l.lastIndex+1 {
 		return ErrOutOfRange
 	}
 	if index == l.firstIndex {
@@ -834,10 +833,7 @@ func (l *Log) TruncateBack(index uint64) error {
 }
 
 func (l *Log) truncateBack(index uint64) (err error) {
-	// Allow index == 0 to truncate all entries when l.firstIndex == 1
-	if l.lastIndex == 0 ||
-		index < l.firstIndex-1 || (!l.opts.AllowEmpty && (index < l.firstIndex || l.firstIndex == 0)) ||
-		index > l.lastIndex {
+	if index < l.firstIndex-1 || index > l.lastIndex {
 		return ErrOutOfRange
 	}
 	if index == l.lastIndex {
