@@ -1,11 +1,13 @@
 package wal
 
 import (
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -30,8 +32,8 @@ func testLog(t *testing.T, opts *Options, N int) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 0 {
-		t.Fatalf("expected %d, got %d", 0, n)
+	if n != 1 {
+		t.Fatalf("expected %d, got %d", 1, n)
 	}
 
 	// LastIndex - should be zero
@@ -287,7 +289,7 @@ func testLog(t *testing.T, opts *Options, N int) {
 	}
 
 	// TruncateFront -- should fail, out of range
-	for _, i := range []int{0, N + 1} {
+	for _, i := range []int{0, N + 2} {
 		index := uint64(i)
 		if err = l.TruncateFront(index); err != ErrOutOfRange {
 			t.Fatalf("expected %v, got %v", ErrOutOfRange, err)
@@ -332,7 +334,7 @@ func testLog(t *testing.T, opts *Options, N int) {
 	}
 
 	// TruncateBack -- should fail, out of range
-	for _, i := range []int{0, 80} {
+	for _, i := range []int{0, 79} {
 		index := uint64(i)
 		if err = l.TruncateBack(index); err != ErrOutOfRange {
 			t.Fatalf("expected %v, got %v", ErrOutOfRange, err)
@@ -416,6 +418,25 @@ func testLog(t *testing.T, opts *Options, N int) {
 
 	l.Sync()
 	testFirstLast(t, l, uint64(N-1), uint64(N), nil)
+
+	// TruncateFront -- truncate all entries
+	if err = l.TruncateFront(uint64(N + 1)); err != nil {
+		t.Fatal(err)
+	}
+	testFirstLast(t, l, uint64(N+1), uint64(N), nil)
+
+	err = l.Write(uint64(N+1), []byte(dataStr(uint64(N+1))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	N++
+	testFirstLast(t, l, uint64(N), uint64(N), nil)
+
+	// TruncateBack -- truncate all entries
+	if err = l.TruncateBack(uint64(N - 1)); err != nil {
+		t.Fatal(err)
+	}
+	testFirstLast(t, l, uint64(N), uint64(N-1), nil)
 }
 
 func testFirstLast(t *testing.T, l *Log, expectFirst, expectLast uint64, data func(index uint64) []byte) {
@@ -888,6 +909,72 @@ func TestConcurrency(t *testing.T) {
 	if exp := int32(100_000); numReads != exp {
 		t.Fatalf("expected %d reads, but god %d", exp, numReads)
 	}
+}
+
+func TestRWConcurrency(t *testing.T) {
+	os.RemoveAll("testlog")
+
+	l, err := Open("testlog", &Options{
+		NoSync: true,
+		NoCopy: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+	notify := make(chan struct{}, 1)
+	count := 100
+
+	go func() {
+		defer wg.Done()
+		defer close(notify)
+		idx, _ := l.LastIndex()
+		for i := 0; i < count; i++ {
+			idx++
+			if err := l.Write(idx, []byte(dataStr(uint64(i)))); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case notify <- struct{}{}:
+			default:
+			}
+		}
+		if idx != uint64(count) {
+			t.Fatalf("expected last index %d, got %d", count, idx)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		idx, _ := l.FirstIndex()
+		for {
+			var ok bool
+			select {
+			case _, ok = <-notify:
+			}
+			for {
+				_, err := l.Read(idx)
+				if errors.Is(err, ErrNotFound) {
+					break
+				}
+				if err := l.TruncateFront(idx + 1); err != nil {
+					t.Fatal(err)
+				}
+				idx++
+			}
+			if !ok {
+				break
+			}
+		}
+		if idx != uint64(count+1) {
+			t.Fatalf("expected first index %d, got %d", count+1, idx)
+		}
+	}()
+
+	wg.Wait()
 }
 
 func must(v interface{}, err error) interface{} {
