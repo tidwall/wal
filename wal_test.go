@@ -858,6 +858,47 @@ func TestSimpleTruncateBack(t *testing.T) {
 
 }
 
+func TestClear(t *testing.T) {
+	os.RemoveAll("testlog")
+
+	l, err := Open("testlog", &Options{
+		NoSync: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	// Write some entries
+	for i := 1; i < 50; i++ {
+		err := l.Write(uint64(i), []byte(dataStr(uint64(i))))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Clear the log
+	if err := l.Clear(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Validate some log information
+	if i, err := l.FirstIndex(); err != nil || i != 0 {
+		t.Fatal(fmt.Errorf("expected first index %d but got %d (error: %w)", 0, i, err))
+	}
+	if i, err := l.LastIndex(); err != nil || i != 0 {
+		t.Fatal(fmt.Errorf("expected last index %d but got %d (error: %w)", 0, i, err))
+	}
+
+	// Ensure we can continue to write after a clear
+	for i := 1; i < 50; i++ {
+		err := l.Write(uint64(i), []byte(dataStr(uint64(i))))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestConcurrency(t *testing.T) {
 	os.RemoveAll("testlog")
 
