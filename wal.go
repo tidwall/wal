@@ -79,17 +79,20 @@ type Options struct {
 	// Perms represents the datafiles modes and permission bits
 	DirPerms  os.FileMode
 	FilePerms os.FileMode
+	// RecoverCorruptedTail will attempt to recover a corrupted tail in the last segment automatically.
+	RecoverCorruptedTail bool
 }
 
 // DefaultOptions for Open().
 var DefaultOptions = &Options{
-	NoSync:           false,    // Fsync after every write
-	SegmentSize:      20971520, // 20 MB log segment files.
-	LogFormat:        Binary,   // Binary format is small and fast.
-	SegmentCacheSize: 2,        // Number of cached in-memory segments
-	NoCopy:           false,    // Make a new copy of data for every Read call.
-	DirPerms:         0750,     // Permissions for the created directories
-	FilePerms:        0640,     // Permissions for the created data files
+	NoSync:               false,    // Fsync after every write
+	SegmentSize:          20971520, // 20 MB log segment files.
+	LogFormat:            Binary,   // Binary format is small and fast.
+	SegmentCacheSize:     2,        // Number of cached in-memory segments
+	NoCopy:               false,    // Make a new copy of data for every Read call.
+	DirPerms:             0750,     // Permissions for the created directories
+	FilePerms:            0640,     // Permissions for the created data files
+	RecoverCorruptedTail: false,    // Don't recover corrupted tail.
 }
 
 // Log represents a write ahead log
@@ -262,15 +265,15 @@ func (l *Log) load() error {
 	l.firstIndex = l.segments[0].index
 	// Open the last segment for appending
 	lseg := l.segments[len(l.segments)-1]
+	// Load the last segment entries
+	if err := l.loadSegmentEntries(lseg, l.opts.RecoverCorruptedTail); err != nil {
+		return err
+	}
 	l.sfile, err = os.OpenFile(lseg.path, os.O_WRONLY, l.opts.FilePerms)
 	if err != nil {
 		return err
 	}
-	if _, err := l.sfile.Seek(0, 2); err != nil {
-		return err
-	}
-	// Load the last segment entries
-	if err := l.loadSegmentEntries(lseg); err != nil {
+	if _, err := l.sfile.Seek(int64(len(lseg.ebuf)), 0); err != nil {
 		return err
 	}
 	l.lastIndex = lseg.index + uint64(len(lseg.epos)) - 1
@@ -533,7 +536,7 @@ func (l *Log) findSegment(index uint64) int {
 	return i - 1
 }
 
-func (l *Log) loadSegmentEntries(s *segment) error {
+func (l *Log) loadSegmentEntries(s *segment, ignoreCorruptedTail bool) error {
 	data, err := ioutil.ReadFile(s.path)
 	if err != nil {
 		return err
@@ -548,6 +551,9 @@ func (l *Log) loadSegmentEntries(s *segment) error {
 		} else {
 			n, err = loadNextBinaryEntry(data)
 		}
+		if err == ErrCorrupt && ignoreCorruptedTail {
+			break
+		}
 		if err != nil {
 			return err
 		}
@@ -555,7 +561,7 @@ func (l *Log) loadSegmentEntries(s *segment) error {
 		epos = append(epos, bpos{pos, pos + n})
 		pos += n
 	}
-	s.ebuf = ebuf
+	s.ebuf = ebuf[:pos]
 	s.epos = epos
 	return nil
 }
@@ -611,7 +617,7 @@ func (l *Log) loadSegment(index uint64) (*segment, error) {
 	s := l.segments[idx]
 	if len(s.epos) == 0 {
 		// load the entries from cache
-		if err := l.loadSegmentEntries(s); err != nil {
+		if err := l.loadSegmentEntries(s, false); err != nil {
 			return nil, err
 		}
 	}
@@ -807,7 +813,7 @@ func (l *Log) truncateFront(index uint64) (err error) {
 			return err
 		}
 		// Load the last segment entries
-		if err = l.loadSegmentEntries(s); err != nil {
+		if err = l.loadSegmentEntries(s, false); err != nil {
 			return err
 		}
 	}
@@ -924,7 +930,7 @@ func (l *Log) truncateBack(index uint64) (err error) {
 	l.segments = append([]*segment{}, l.segments[:segIdx+1]...)
 	l.lastIndex = index
 	l.clearCache()
-	if err = l.loadSegmentEntries(s); err != nil {
+	if err = l.loadSegmentEntries(s, false); err != nil {
 		return err
 	}
 	return nil
