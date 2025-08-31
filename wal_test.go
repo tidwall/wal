@@ -1326,3 +1326,19 @@ func TestEmptyTruncateBackTwice(t *testing.T) {
 		t.Fatalf("expected %v, got %v", true, empty)
 	}
 }
+
+func TestIssue33(t *testing.T) {
+	// Create a fresh log without allowempty, close, and reopen.
+	// This should not fail with an ErrEmptyLog
+	os.RemoveAll("testlog")
+	l, err := Open("log", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+	l, err = Open("log", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Close()
+}

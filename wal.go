@@ -294,7 +294,7 @@ func (l *Log) load() error {
 		return err
 	}
 	l.lastIndex = lseg.index + uint64(len(lseg.epos)) - 1
-	if l.firstIndex > l.lastIndex && !l.opts.AllowEmpty {
+	if l.lastIndex > 0 && l.firstIndex > l.lastIndex && !l.opts.AllowEmpty {
 		return ErrEmptyLog
 	}
 	return nil
