@@ -1331,12 +1331,12 @@ func TestIssue33(t *testing.T) {
 	// Create a fresh log without allowempty, close, and reopen.
 	// This should not fail with an ErrEmptyLog
 	os.RemoveAll("testlog")
-	l, err := Open("log", nil)
+	l, err := Open("testlog", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	l.Close()
-	l, err = Open("log", nil)
+	l, err = Open("testlog", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
