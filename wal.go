@@ -364,6 +364,7 @@ func (l *Log) cycle() error {
 	s := &segment{
 		index: l.lastIndex + 1,
 		path:  filepath.Join(l.path, segmentName(l.lastIndex+1)),
+		ebuf:  make([]byte, 0, l.opts.SegmentSize),
 	}
 	var err error
 	l.sfile, err = os.OpenFile(s.path, os.O_CREATE|os.O_RDWR|os.O_TRUNC,
