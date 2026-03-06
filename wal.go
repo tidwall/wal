@@ -658,26 +658,7 @@ func (l *Log) Read(index uint64) (data []byte, err error) {
 	if err != nil {
 		return nil, err
 	}
-	epos := s.epos[index-s.index]
-	edata := s.ebuf[epos.pos:epos.end]
-	if l.opts.LogFormat == JSON {
-		return readJSON(edata)
-	}
-	// binary read
-	size, n := binary.Uvarint(edata)
-	if n <= 0 {
-		return nil, ErrCorrupt
-	}
-	if uint64(len(edata)-n) < size {
-		return nil, ErrCorrupt
-	}
-	if l.opts.NoCopy {
-		data = edata[n : uint64(n)+size]
-	} else {
-		data = make([]byte, size)
-		copy(data, edata[n:])
-	}
-	return data, nil
+	return l.readEntry(s, index)
 }
 
 //go:noinline
@@ -975,6 +956,186 @@ func (l *Log) Sync() error {
 		return ErrClosed
 	}
 	return l.sfile.Sync()
+}
+
+// readEntryCopy is like readEntry but always copies the result, regardless of
+// the NoCopy option. This is needed for batch reads where segment eviction may
+// invalidate slices returned from earlier iterations.
+func (l *Log) readEntryCopy(s *segment, index uint64) ([]byte, error) {
+	epos := s.epos[index-s.index]
+	edata := s.ebuf[epos.pos:epos.end]
+	if l.opts.LogFormat == JSON {
+		return readJSON(edata)
+	}
+	size, n := binary.Uvarint(edata)
+	if n <= 0 {
+		return nil, ErrCorrupt
+	}
+	if uint64(len(edata)-n) < size {
+		return nil, ErrCorrupt
+	}
+	data := make([]byte, size)
+	copy(data, edata[n:])
+	return data, nil
+}
+
+// readEntry decodes a single entry from the segment buffer. Must be called
+// under at least an RLock.
+func (l *Log) readEntry(s *segment, index uint64) ([]byte, error) {
+	epos := s.epos[index-s.index]
+	edata := s.ebuf[epos.pos:epos.end]
+	if l.opts.LogFormat == JSON {
+		return readJSON(edata)
+	}
+	size, n := binary.Uvarint(edata)
+	if n <= 0 {
+		return nil, ErrCorrupt
+	}
+	if uint64(len(edata)-n) < size {
+		return nil, ErrCorrupt
+	}
+	if l.opts.NoCopy {
+		return edata[n : uint64(n)+size], nil
+	}
+	data := make([]byte, size)
+	copy(data, edata[n:])
+	return data, nil
+}
+
+// readMany is the shared iteration logic for ReadMany and ReadManyHeaders.
+// It takes the lock, clamps the range to valid indices, iterates with segment
+// reuse, and calls readFn for each entry.
+func (l *Log) readMany(start uint64, count int,
+	readFn func(*segment, uint64) ([]byte, error)) ([][]byte, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.corrupt {
+		return nil, ErrCorrupt
+	} else if l.closed {
+		return nil, ErrClosed
+	}
+	if count <= 0 || l.firstIndex > l.lastIndex {
+		return nil, nil
+	}
+	if start < l.firstIndex {
+		start = l.firstIndex
+	}
+	// Clamp end to lastIndex using overflow-safe arithmetic.
+	end := l.lastIndex
+	if avail := l.lastIndex - start + 1; uint64(count) < avail {
+		end = start + uint64(count) - 1
+	}
+	if start > end {
+		return nil, nil
+	}
+	results := make([][]byte, 0, end-start+1)
+	var curSeg *segment
+	for i := start; i <= end; i++ {
+		if curSeg == nil || i < curSeg.index || i >= curSeg.index+uint64(len(curSeg.epos)) {
+			var err error
+			curSeg, err = l.loadSegment(i)
+			if err != nil {
+				return nil, err
+			}
+		}
+		data, err := readFn(curSeg, i)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, data)
+	}
+	return results, nil
+}
+
+// ReadMany reads entries from start to start+count-1 (inclusive) in a single
+// call, returning a slice of data for each entry. This is more efficient than
+// calling Read in a loop because it takes the lock once and reuses segment
+// lookups for consecutive entries in the same segment.
+// Entries that fall outside the log's range are not included; the returned
+// slice may be shorter than count.
+// When the NoCopy option is set and the range spans multiple non-tail segments,
+// earlier results may reference segment buffers that are evicted from the LRU
+// cache by later segment loads. For safety, ReadMany always copies entry data
+// regardless of the NoCopy option.
+func (l *Log) ReadMany(start uint64, count int) ([][]byte, error) {
+	return l.readMany(start, count, l.readEntryCopy)
+}
+
+// ReadManyHeaders reads the first n bytes of each entry from start to
+// start+count-1 (inclusive) in a single call. This combines the efficiency
+// of ReadMany (single lock, segment reuse) with ReadHeader (partial reads).
+// Entries outside the log's range are not included; the returned slice may
+// be shorter than count.
+func (l *Log) ReadManyHeaders(start uint64, count, n int) ([][]byte, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	return l.readMany(start, count, func(s *segment, index uint64) ([]byte, error) {
+		return l.readEntryHeader(s, index, n)
+	})
+}
+
+// readEntryHeader decodes the first n bytes of a single entry from the segment
+// buffer. Always copies the result. Must be called under at least an RLock.
+func (l *Log) readEntryHeader(s *segment, index uint64, n int) ([]byte, error) {
+	epos := s.epos[index-s.index]
+	edata := s.ebuf[epos.pos:epos.end]
+	if l.opts.LogFormat == JSON {
+		full, err := readJSON(edata)
+		if err != nil {
+			return nil, err
+		}
+		if n >= len(full) {
+			return full, nil
+		}
+		data := make([]byte, n)
+		copy(data, full)
+		return data, nil
+	}
+	size, sn := binary.Uvarint(edata)
+	if sn <= 0 {
+		return nil, ErrCorrupt
+	}
+	if uint64(len(edata)-sn) < size {
+		return nil, ErrCorrupt
+	}
+	if uint64(n) > size {
+		n = int(size)
+	}
+	data := make([]byte, n)
+	copy(data, edata[sn:])
+	return data, nil
+}
+
+// ReadHeader returns the first n bytes of the entry data at the given index.
+// If the entry data is shorter than n bytes, the entire data is returned.
+// If n is zero or negative, (nil, nil) is returned.
+// This is useful for reading fixed-size metadata headers from entries without
+// copying the full payload. The returned data is always a copy, even when the
+// NoCopy option is set, because header reads are small and the segment buffer
+// may be evicted by the LRU cache.
+func (l *Log) ReadHeader(index uint64, n int) (data []byte, err error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.corrupt {
+		return nil, ErrCorrupt
+	} else if l.closed {
+		return nil, ErrClosed
+	}
+	if n <= 0 {
+		return nil, nil
+	}
+	if l.firstIndex > l.lastIndex {
+		return nil, ErrNotFound
+	}
+	if index < l.firstIndex || index > l.lastIndex {
+		return nil, ErrNotFound
+	}
+	s, err := l.loadSegment(index)
+	if err != nil {
+		return nil, err
+	}
+	return l.readEntryHeader(s, index, n)
 }
 
 // IsEmpty returns true if there are no entries in the log.
