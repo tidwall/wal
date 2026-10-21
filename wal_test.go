@@ -1342,3 +1342,151 @@ func TestIssue33(t *testing.T) {
 	}
 	l.Close()
 }
+
+func TestLoadSegmentCacheRange(t *testing.T) {
+	os.RemoveAll("testlog")
+	defer os.RemoveAll("testlog")
+
+	opts := *DefaultOptions
+	opts.NoSync = true
+	opts.SegmentCacheSize = 3
+	opts.SegmentSize = 256
+
+	l, err := Open("testlog", &opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	// Write entries to create multiple segments so that scache fills with 3 segments
+	// and additional segments exist.
+	for i := uint64(1); i <= 50; i++ {
+		data := []byte(fmt.Sprintf("entry-payload-%04d", i))
+		if err := l.Write(i, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if len(l.segments) < 4 {
+		t.Fatalf("expected at least 4 segments, got %d", len(l.segments))
+	}
+
+	// Collect cached segments from l.scache.Range in MRU order.
+	var cached []*segment
+	l.scache.Range(func(_, v interface{}) bool {
+		cached = append(cached, v.(*segment))
+		return true
+	})
+
+	if len(cached) < 3 {
+		t.Fatalf("expected 3 cached segments in scache, got %d", len(cached))
+	}
+
+	headSeg := cached[0]
+	// Pick a segment that is in scache but is not at the head of scache.Range (tail of cache).
+	targetSeg := cached[len(cached)-1]
+	if targetSeg == headSeg {
+		t.Fatal("target segment should not be the head segment")
+	}
+
+	if len(targetSeg.epos) == 0 || len(targetSeg.ebuf) == 0 {
+		t.Fatal("target segment should have cached entries in memory")
+	}
+
+	targetIndex := targetSeg.index
+	ebufPtrBefore := &targetSeg.ebuf[0]
+
+	// Call loadSegment for an index belonging to targetSeg.
+	seg, err := l.loadSegment(targetIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seg != targetSeg {
+		t.Fatalf("expected segment index %d, got %d", targetSeg.index, seg.index)
+	}
+
+	// Verify that the segment buffer was not reloaded (same memory slice).
+	ebufPtrAfter := &seg.ebuf[0]
+	if ebufPtrBefore != ebufPtrAfter {
+		t.Fatal("segment entries buffer was unexpectedly reloaded from disk")
+	}
+
+	// Verify that loadSegment returned rseg directly from scache.Range without
+	// falling through to pushCache. If it fell through to pushCache, targetSeg
+	// would have been moved to the head of scache.
+	var headAfter *segment
+	l.scache.Range(func(_, v interface{}) bool {
+		headAfter = v.(*segment)
+		return false
+	})
+
+	if headAfter != headSeg {
+		t.Fatalf("expected head of scache to remain %d, but got %d (pushCache was called)",
+			headSeg.index, headAfter.index)
+	}
+
+	// Also verify reading the entry returns expected payload.
+	data, err := l.Read(targetIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedData := []byte(fmt.Sprintf("entry-payload-%04d", targetIndex))
+	if string(data) != string(expectedData) {
+		t.Fatalf("expected %s, got %s", expectedData, data)
+	}
+
+	// Also test middle cached segment (cached[1]).
+	midSeg := cached[1]
+	midIndex := midSeg.index
+	midEbufPtrBefore := &midSeg.ebuf[0]
+
+	midResult, err := l.loadSegment(midIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if midResult != midSeg {
+		t.Fatalf("expected mid segment index %d, got %d", midSeg.index, midResult.index)
+	}
+	if &midResult.ebuf[0] != midEbufPtrBefore {
+		t.Fatal("mid segment entries buffer was unexpectedly reloaded from disk")
+	}
+
+	// Cache head should still be untouched.
+	var headAfterMid *segment
+	l.scache.Range(func(_, v interface{}) bool {
+		headAfterMid = v.(*segment)
+		return false
+	})
+	if headAfterMid != headSeg {
+		t.Fatalf("expected head of scache to remain %d, but got %d",
+			headSeg.index, headAfterMid.index)
+	}
+
+	// Test evicted segment lookup: verify that an index belonging to an evicted
+	// segment correctly misses scache.Range, loads entries via loadSegmentEntries,
+	// and promotes the segment to the head of scache.
+	evictedSeg := l.segments[0]
+	if len(evictedSeg.epos) == 0 {
+		evictedIndex := evictedSeg.index
+		resSeg, err := l.loadSegment(evictedIndex)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resSeg != evictedSeg {
+			t.Fatalf("expected evicted segment %d, got %d", evictedSeg.index, resSeg.index)
+		}
+		if len(resSeg.epos) == 0 {
+			t.Fatal("expected evicted segment entries to be reloaded into memory")
+		}
+		var headAfterEvicted *segment
+		l.scache.Range(func(_, v interface{}) bool {
+			headAfterEvicted = v.(*segment)
+			return false
+		})
+		if headAfterEvicted != evictedSeg {
+			t.Fatalf("expected evicted segment %d to be at head of scache, got %d",
+				evictedSeg.index, headAfterEvicted.index)
+		}
+	}
+}
+
