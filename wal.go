@@ -114,6 +114,7 @@ var DefaultOptions = &Options{
 // Log represents a write ahead log
 type Log struct {
 	mu         sync.RWMutex
+	cmu        sync.Mutex  // guards cache and cached segment buffers
 	path       string      // absolute path to log directory
 	opts       Options     // log options
 	closed     bool        // log is closed
@@ -360,7 +361,9 @@ func (l *Log) cycle() error {
 		return err
 	}
 	// cache the previous segment
+	l.cmu.Lock()
 	l.pushCache(len(l.segments) - 1)
+	l.cmu.Unlock()
 	s := &segment{
 		index: l.lastIndex + 1,
 		path:  filepath.Join(l.path, segmentName(l.lastIndex+1)),
@@ -642,6 +645,17 @@ func (l *Log) loadSegment(index uint64) (*segment, error) {
 	return s, nil
 }
 
+func (l *Log) readEntryData(index uint64) ([]byte, error) {
+	l.cmu.Lock()
+	defer l.cmu.Unlock()
+	s, err := l.loadSegment(index)
+	if err != nil {
+		return nil, err
+	}
+	epos := s.epos[index-s.index]
+	return s.ebuf[epos.pos:epos.end], nil
+}
+
 // Read an entry from the log. Returns a byte slice containing the data entry.
 func (l *Log) Read(index uint64) (data []byte, err error) {
 	l.mu.RLock()
@@ -654,12 +668,18 @@ func (l *Log) Read(index uint64) (data []byte, err error) {
 	if index < l.firstIndex || index > l.lastIndex {
 		return nil, ErrNotFound
 	}
-	s, err := l.loadSegment(index)
-	if err != nil {
-		return nil, err
+	var edata []byte
+	lseg := l.segments[len(l.segments)-1]
+	if index >= lseg.index {
+		epos := lseg.epos[index-lseg.index]
+		edata = lseg.ebuf[epos.pos:epos.end]
+	} else {
+		var err error
+		edata, err = l.readEntryData(index)
+		if err != nil {
+			return nil, err
+		}
 	}
-	epos := s.epos[index-s.index]
-	edata := s.ebuf[epos.pos:epos.end]
 	if l.opts.LogFormat == JSON {
 		return readJSON(edata)
 	}
@@ -715,6 +735,8 @@ func (l *Log) ClearCache() error {
 }
 
 func (l *Log) clearCache() {
+	l.cmu.Lock()
+	defer l.cmu.Unlock()
 	l.scache.Range(func(_, v interface{}) bool {
 		s := v.(*segment)
 		s.ebuf = nil
@@ -791,12 +813,15 @@ func (l *Log) truncateFront(index uint64) (err error) {
 		ebuf = nil
 	} else {
 		segIdx = l.findSegment(index)
+		l.cmu.Lock()
 		s, err = l.loadSegment(index)
 		if err != nil {
+			l.cmu.Unlock()
 			return err
 		}
 		epos := s.epos[index-s.index:]
 		ebuf = s.ebuf[epos[0].pos:]
+		l.cmu.Unlock()
 	}
 	// Create a START file contains the truncated segment.
 	startName := filepath.Join(l.path, segmentName(index)+".START")
@@ -899,12 +924,15 @@ func (l *Log) truncateBack(index uint64) (err error) {
 		ebuf = nil
 	} else {
 		segIdx = l.findSegment(index)
+		l.cmu.Lock()
 		s, err = l.loadSegment(index)
 		if err != nil {
+			l.cmu.Unlock()
 			return err
 		}
 		epos := s.epos[:index-s.index+1]
 		ebuf = s.ebuf[:epos[len(epos)-1].end]
+		l.cmu.Unlock()
 	}
 	// Create an END file contains the truncated segment.
 	endName := filepath.Join(l.path, segmentName(s.index)+".END")

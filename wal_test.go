@@ -1342,3 +1342,138 @@ func TestIssue33(t *testing.T) {
 	}
 	l.Close()
 }
+
+func testIssue34(t *testing.T, format LogFormat, noCopy bool) {
+	logPath := "testlog/" + strings.Join(strings.Split(t.Name(), "/")[1:], "/")
+	os.RemoveAll(logPath)
+	defer os.RemoveAll(logPath)
+
+	opts := *DefaultOptions
+	opts.NoSync = true
+	opts.SegmentSize = 1024
+	opts.SegmentCacheSize = 1
+	opts.LogFormat = format
+	opts.NoCopy = noCopy
+
+	l, err := Open(logPath, &opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	const totalEntries = 300
+	for i := 1; i <= totalEntries; i++ {
+		if err := l.Write(uint64(i), []byte(dataStr(uint64(i)))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	const numGoroutines = 16
+	const readsPerGoroutine = 200
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	for g := 0; g < numGoroutines; g++ {
+		go func(seed int64) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(seed))
+			for i := 0; i < readsPerGoroutine; i++ {
+				idx := uint64(r.Intn(totalEntries) + 1)
+				data, err := l.Read(idx)
+				if err != nil {
+					t.Errorf("read failed for %d: %v", idx, err)
+					return
+				}
+				if string(data) != dataStr(idx) {
+					t.Errorf("expected %s, got %s", dataStr(idx), string(data))
+					return
+				}
+			}
+		}(int64(g))
+	}
+	wg.Wait()
+}
+
+func testIssue34RWChurn(t *testing.T) {
+	logPath := "testlog/" + strings.Join(strings.Split(t.Name(), "/")[1:], "/")
+	os.RemoveAll(logPath)
+	defer os.RemoveAll(logPath)
+
+	opts := *DefaultOptions
+	opts.NoSync = true
+	opts.SegmentSize = 512
+	opts.SegmentCacheSize = 1
+
+	l, err := Open(logPath, &opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	const initialEntries = 100
+	for i := 1; i <= initialEntries; i++ {
+		if err := l.Write(uint64(i), []byte(dataStr(uint64(i)))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var maxIndex int64 = initialEntries
+	var stop int32
+	var wg sync.WaitGroup
+
+	const numReaders = 8
+	for g := 0; g < numReaders; g++ {
+		wg.Add(1)
+		go func(seed int64) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(seed))
+			for atomic.LoadInt32(&stop) == 0 {
+				curMax := atomic.LoadInt64(&maxIndex)
+				if curMax < 1 {
+					continue
+				}
+				idx := uint64(r.Int63n(curMax) + 1)
+				data, err := l.Read(idx)
+				if err != nil {
+					t.Errorf("read failed for %d: %v", idx, err)
+					return
+				}
+				if string(data) != dataStr(idx) {
+					t.Errorf("expected %s, got %s", dataStr(idx), string(data))
+					return
+				}
+			}
+		}(int64(g))
+	}
+
+	const additionalEntries = 300
+	for i := initialEntries + 1; i <= initialEntries+additionalEntries; i++ {
+		if err := l.Write(uint64(i), []byte(dataStr(uint64(i)))); err != nil {
+			t.Fatal(err)
+		}
+		atomic.StoreInt64(&maxIndex, int64(i))
+	}
+
+	atomic.StoreInt32(&stop, 1)
+	wg.Wait()
+}
+
+func TestIssue34(t *testing.T) {
+	t.Run("binary-copy", func(t *testing.T) {
+		testIssue34(t, Binary, false)
+	})
+	t.Run("binary-nocopy", func(t *testing.T) {
+		testIssue34(t, Binary, true)
+	})
+	t.Run("json-copy", func(t *testing.T) {
+		testIssue34(t, JSON, false)
+	})
+	t.Run("json-nocopy", func(t *testing.T) {
+		testIssue34(t, JSON, true)
+	})
+	t.Run("concurrent-rw-churn", func(t *testing.T) {
+		testIssue34RWChurn(t)
+	})
+}
+
+
